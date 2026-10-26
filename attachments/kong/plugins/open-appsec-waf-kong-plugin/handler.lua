@@ -557,7 +557,7 @@ function NanoHandler.log(conf)
         nano.cleanup_all()
         ctx.session_data = nil
         ctx.session_id = nil
-        collectgarbage("collect")
+        collectgarbage("restart")
     end
 end
 
