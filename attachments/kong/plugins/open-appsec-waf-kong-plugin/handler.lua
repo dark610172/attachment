@@ -418,7 +418,9 @@ function NanoHandler.access(conf)
     end
 
     local has_content_length = tonumber(ngx.var.http_content_length) and tonumber(ngx.var.http_content_length) > 0
-    local contains_body = has_content_length and 1 or 0
+    local transfer_encoding = ngx.var.http_transfer_encoding
+    local is_chunked = transfer_encoding and string.find(string.lower(transfer_encoding), "chunked") ~= nil
+    local contains_body = (has_content_length or is_chunked) and 1 or 0
     
     if is_async_mode then
         return handle_access_async(ctx, session_id, session_data, meta_data, req_headers, contains_body)

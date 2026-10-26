@@ -184,6 +184,12 @@ static int lua_allocHttpHeaders(lua_State *L) {
 static int lua_freeHttpHeaders(lua_State *L) {
     HttpHeaders *headers = (HttpHeaders *) lua_touserdata(L, 1);
     if (headers) {
+        size_t count = headers->headers_count;
+        if (count > MAX_HEADERS) count = MAX_HEADERS;
+        for (size_t i = 0; i < count; i++) {
+            free(headers->data[i].key.data);
+            free(headers->data[i].value.data);
+        }
         free(headers->data);
         free(headers);
     }
