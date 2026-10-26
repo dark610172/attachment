@@ -237,48 +237,14 @@ local function handle_access_async(ctx, session_id, session_data, meta_data, req
             response = nil
         end
     else
-        local end_result = nano.end_inspection_async(session_id, session_data, nano.HttpChunkType.HTTP_REQUEST_END)
-        if end_result ~= nano.NanoCommunicationResult.NANO_OK then
-            kong.log.debug("end_inspection_async failed (session=", session_id, ", result=", end_result, ")")
-            ctx.fail_open_mode = true
-            goto cleanup
-        end
-
-        verdict, response = verdict_handler.wait_for_verdict_async(nano, sem, session_id, nano.get_req_header_thread_timeout, 3, ctx, "end inspection (no body)")
-        if not verdict then
-            ctx.fail_open_mode = true
-            if response == "blocked" then
-                ctx.is_final_verdict = true
-                kong.response.exit(403, "Request blocked")
-            end
-            goto cleanup
-        end
-
-        -- Handle DELAYED verdict
-        verdict, response = verdict_handler.handle_delayed_verdict(nano, session_id, session_data, sem, verdict, response, pending)
-        if not verdict then
-            kong.log.debug("Freeing session (session=", session_id, ")")
-            nano.fini_session(session_data)
-            ctx.session_finalized = true
-            ctx.fail_open_mode = true
-            goto cleanup
-        end
-
-        if verdict == nano.AttachmentVerdict.DROP then
-            kong.log.debug("Request blocked: end inspection (session=", session_id, ")")
-            ctx.is_final_verdict = true
-            final_response = response
-            verdict_handler.handle_drop_verdict(nano, nano_attachment, ctx, session_id, session_data, response, true, meta_data, req_headers, sem, pending)
-            meta_data, req_headers = nil, nil  -- Resources freed by handle_drop_verdict
-            goto cleanup
-        elseif verdict == nano.AttachmentVerdict.ACCEPT then
-            ctx.is_final_verdict = true
-        end
-        
-        if response then
-            nano.free_verdict_response(session_data, response)
-            response = nil
-        end
+        -- contains_body == 0: SendRequestFilterAsyncImpl (the C layer invoked by
+        -- send_data_async above) already appends HTTP_REQUEST_END to the same
+        -- batch as the headers when the request has no body, so the verdict
+        -- already received from wait_for_verdict_async above (the "headers"
+        -- wait) is the final verdict. Sending a second end_inspection_async here
+        -- duplicated REQUEST_END and waited out a full get_req_header_thread_timeout
+        -- for a verdict the agent was never going to send again, forcing every
+        -- bodyless request to fail open after that wait.
     end
 
     ::cleanup::
