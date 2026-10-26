@@ -34,6 +34,7 @@ static const int max_debug_level = static_cast<int>(CompressionUtilsDebugLevel::
 static const int max_retries = 3;
 static const size_t default_brotli_buffer_size = 16384;
 static const size_t brotli_decompression_probe_size = 64;
+static const size_t max_decompressed_output_size = 256 * 1024 * 1024; // 256 MB max decompressed output (zlib/gzip)
 
 static void
 defaultPrint(const char *debug_message)
@@ -171,6 +172,10 @@ struct CompressionStream
 
             if (stream.total_out != old_total_out) {
                 res.append(work_space.data(), stream.total_out - old_total_out);
+                if (res.size() > max_decompressed_output_size) {
+                    fini();
+                    throw runtime_error("Decompression output size limit exceeded - possibly a decompression bomb");
+                }
             } else {
                 ++retries;
                 if (retries > max_retries) {
