@@ -204,6 +204,9 @@ static int lua_setHeaderCount(lua_State *L) {
         return 0;
     }
 
+    if (count < 0) count = 0;
+    if (count > MAX_HEADERS) count = MAX_HEADERS;
+
     headers->headers_count = count;
     return 0;
 }
