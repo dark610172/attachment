@@ -10,7 +10,7 @@ local kong = kong
 
 local NanoHandler = {}
 
-NanoHandler.PRIORITY = 3000
+NanoHandler.PRIORITY = 900
 NanoHandler.VERSION = "1.0.0"
 
 NanoHandler.sessions = {}
