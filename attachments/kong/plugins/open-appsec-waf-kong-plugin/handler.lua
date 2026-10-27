@@ -397,7 +397,8 @@ end
 
 function NanoHandler.header_filter(conf)
     local ctx = kong.ctx.plugin
-    
+    if not ctx.session_id then return end
+
     if ctx.blocked or ctx.fail_open_mode or ctx.is_final_verdict then
         return
     end
@@ -451,7 +452,8 @@ end
 
 function NanoHandler.body_filter(conf)
     local ctx = kong.ctx.plugin
-    
+    if not ctx.session_id then return end
+
     if ctx.blocked or ctx.fail_open_mode or ctx.is_final_verdict then
         return
     end
