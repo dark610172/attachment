@@ -352,7 +352,7 @@ function NanoHandler.access(conf)
 
     local session_data = nano.init_session(session_id)
     if not session_data then
-        kong.ctx.plugin.cleanup_needed = false
+        kong.ctx.plugin.cleanup_needed = true
         return
     end
 
