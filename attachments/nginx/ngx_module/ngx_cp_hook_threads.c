@@ -229,7 +229,8 @@ ngx_http_cp_req_header_handler_thread(void *_ctx)
         REQUEST_HEADER,
         session_data_p->session_id,
         &num_messages_sent,
-        ctx->filter_mode
+        ctx->filter_mode,
+        NULL
     );
     if (send_header_result != NGX_OK) {
         write_dbg(
@@ -258,7 +259,7 @@ ngx_http_cp_req_body_filter_thread(void *_ctx)
     ngx_int_t is_last_part;
     ngx_int_t send_body_result;
     ngx_uint_t num_messages_sent = 0;
-    ngx_int_t part_count = 0;
+    ngx_int_t part_count = ctx->chain_part_number;
 
     send_body_result = ngx_http_cp_body_sender(
         ctx->chain,
@@ -271,6 +272,8 @@ ngx_http_cp_req_body_filter_thread(void *_ctx)
         ctx->filter_mode
     );
 
+    ctx->chain_part_number = part_count;
+    session_data_p->remaining_messages_to_reply += num_messages_sent;
     if (send_body_result != NGX_OK) {
         write_dbg(
             DBG_LEVEL_WARNING,
@@ -283,8 +286,6 @@ ngx_http_cp_req_body_filter_thread(void *_ctx)
         }
         THREAD_CTX_RETURN(NGX_HTTP_FORBIDDEN);
     }
-        session_data_p->remaining_messages_to_reply += num_messages_sent;
-
     // Fetch nano services' results.
     ctx->res = ngx_http_cp_reply_receiver(
         &session_data_p->remaining_messages_to_reply,
@@ -435,7 +436,8 @@ ngx_http_cp_res_header_filter_thread(void *_ctx)
             RESPONSE_HEADER,
             session_data_p->session_id,
             &num_messages_sent,
-            ctx->filter_mode
+            ctx->filter_mode,
+            &request->headers_out.content_type
         );
         if (send_header_result != NGX_OK) {
             write_dbg(
@@ -498,6 +500,8 @@ ngx_http_cp_res_body_filter_thread(void *_ctx)
         ctx->filter_mode
     );
 
+    ctx->chain_part_number = part_number;
+    session_data_p->remaining_messages_to_reply += num_messages_sent;
     write_dbg(
         DBG_LEVEL_DEBUG,
         "Body sender result: %d, num_messages_sent: %d, is_last_response_part: %d for session ID: %d",
@@ -519,8 +523,6 @@ ngx_http_cp_res_body_filter_thread(void *_ctx)
         }
         THREAD_CTX_RETURN(NGX_HTTP_FORBIDDEN);
     }
-    session_data_p->remaining_messages_to_reply += num_messages_sent;
-
     ctx->res = ngx_http_cp_reply_receiver(
         &session_data_p->remaining_messages_to_reply,
         &session_data_p->verdict,

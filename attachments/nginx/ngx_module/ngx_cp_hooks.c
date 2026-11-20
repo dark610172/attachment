@@ -790,8 +790,9 @@ ngx_http_cp_req_body_filter_sync(ngx_http_request_t *request, ngx_chain_t *reque
     init_thread_ctx(&ctx, request, session_data_p, request_body_chain);
 
     write_dbg(DBG_LEVEL_DEBUG, "spawn ngx_http_cp_req_body_filter_thread");
-    // Open threads while unprocessed chain elements still exist, up to num of elements in the chain iterations
-    for (chain_elem = ctx.chain; chain_elem != NULL && ctx.chain; chain_elem = chain_elem->next) {
+    /* The sender may stop within a buffer after enqueue backpressure. */
+    while (ctx.chain != NULL) {
+        chain_elem = ctx.chain;
         // Notify if zero-size buf is marked as "memory". This should never happen but if it does we want to know.
         if (chain_elem->buf && chain_elem->buf->pos &&
             (chain_elem->buf->last - chain_elem->buf->pos == 0) && chain_elem->buf->memory == 1) {
@@ -1079,6 +1080,8 @@ ngx_http_cp_res_header_filter_core(ngx_http_request_t *request, int filter_mode)
         session_data_p->verdict = TRAFFIC_VERDICT_ACCEPT;
         return ngx_http_next_response_header_filter(request);
     }
+
+    if (filter_mode == SYNC_FILTER) request->filter_need_in_memory = 1;
 
     init_thread_ctx(&ctx, request, session_data_p, NULL);
     ctx.filter_mode = (filter_mode == ASYNC_FILTER) ? ASYNC_FILTER : SYNC_FILTER;
@@ -1496,8 +1499,9 @@ ngx_http_cp_res_body_filter_core(ngx_http_request_t *request, ngx_chain_t *body_
     ctx.filter_mode = (filter_mode == ASYNC_FILTER) ? ASYNC_FILTER : SYNC_FILTER;
 
     write_dbg(DBG_LEVEL_DEBUG, "spawn ngx_http_cp_res_body_filter_thread");
-    // Open threads while unprocessed chain elements still exist, up to num of elements in the chain iterations
-    for (chain_elem = ctx.chain; chain_elem != NULL && ctx.chain; chain_elem = chain_elem->next) {
+    /* Follow the sender's first unsent buffer, including a partial buffer. */
+    while (ctx.chain != NULL) {
+        chain_elem = ctx.chain;
         // Notify if zero-size buf is marked as "memory". This should never happen but if it does we want to know.
         if (chain_elem->buf && chain_elem->buf->pos &&
             (chain_elem->buf->last - chain_elem->buf->pos == 0) && chain_elem->buf->memory == 1) {
@@ -1556,7 +1560,6 @@ ngx_http_cp_res_body_filter_core(ngx_http_request_t *request, ngx_chain_t *body_
             fini_cp_session_data(session_data_p);
             return ngx_http_next_response_body_filter(request, body_chain);
         }
-        ctx.chain_part_number++;
     }
 
     if (ctx.chain) {

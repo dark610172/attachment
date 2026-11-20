@@ -48,6 +48,8 @@ typedef struct ngx_http_cp_session_data {
     double                 res_proccesing_time; ///< Holds session's response processing time.
     uint64_t               processed_req_body_size; ///< Holds session's request body's size.
     uint64_t               processed_res_body_size; ///< Holds session's response body's size'.
+    ngx_chain_t           *body_sender_chain; ///< Buffer with an unsent body suffix.
+    size_t                 body_sender_offset; ///< Bytes already sent from that buffer.
     ngx_int_t              is_res_body_inspected; ///< Holds if the response body was inspected
     ngx_int_t              async_processing_needed; ///< Holds if async processing is needed in filters
     ngx_int_t              body_processed; ///< Holds if request body processing is complete

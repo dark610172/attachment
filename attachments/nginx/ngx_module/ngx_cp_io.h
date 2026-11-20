@@ -147,6 +147,7 @@ ngx_http_cp_content_length_sender(
 ///
 /// @brief  Sends request/response headers to the nano service.
 /// @param[in] headers Headers to be sent.
+/// @param[in] content_type Optional response Content-Type to append after the generic list.
 /// @param[in, out] header_type Sets the header type, can be of the values:
 ///         - #REQUEST_HEADER
 ///         - #RESPONSE_HEADER
@@ -163,7 +164,8 @@ ngx_http_cp_header_sender(
     AttachmentDataType header_type,
     uint32_t cur_request_id,
     ngx_uint_t *num_messages_sent,
-    ngx_uint_t filter_mode
+    ngx_uint_t filter_mode,
+    ngx_str_t *content_type
 );
 
 ///
@@ -267,7 +269,7 @@ set_fragments_identifiers(
     uint16_t *data_type,
     uint32_t *cur_request_id);
 
-void set_fragment_elem(char **meta_data_elems, uint16_t *meta_data_sizes, void *data, uint16_t size, uint idx);
+void set_fragment_elem(char **meta_data_elems, uint16_t *meta_data_sizes, void *data, size_t size, uint idx);
 void add_header_to_bulk(char **fragments, uint16_t *fragments_sizes, ngx_table_elt_t *header, ngx_uint_t index);
 
 ngx_int_t handle_custom_response(HttpCustomResponseData *custom_response_data);
