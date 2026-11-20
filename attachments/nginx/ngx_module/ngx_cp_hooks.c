@@ -54,6 +54,29 @@ static const uint one_minute = 60;
 
 static const size_t MIN_POOL_SIZE = 4096; // Minimum suggested pool size by NGINX
 
+ngx_int_t
+ngx_cp_primary_ipc_ready(void)
+{
+    return nano_service_ipc != NULL && comm_socket >= 0;
+}
+
+#ifdef NGINX_ASYNC_SUPPORTED
+static ngx_uint_t primary_sync_sessions;
+
+ngx_uint_t
+ngx_cp_active_sync_sessions(void)
+{
+    return primary_sync_sessions;
+}
+
+static void
+ngx_cp_release_sync_session(void *data)
+{
+    (void)data;
+    primary_sync_sessions--;
+}
+#endif
+
 ///
 /// @brief Initates a session data pointer.
 /// @param[in] request NGINX request.
@@ -62,7 +85,7 @@ static const size_t MIN_POOL_SIZE = 4096; // Minimum suggested pool size by NGIN
 ///         - #NULL
 ///
 ngx_http_cp_session_data *
-init_cp_session_data(ngx_http_request_t *request)
+init_cp_session_data(ngx_http_request_t *request, ngx_int_t async_mode)
 {
     static uint32_t session_id = 1;
 
@@ -97,7 +120,15 @@ init_cp_session_data(ngx_http_request_t *request)
     session_data->is_res_body_inspected = 0;
     session_data->async_processing_needed = 0;
     session_data->body_processed = 0;
-    session_data->initial_async_mode = -1;
+    session_data->initial_async_mode = async_mode;
+#ifdef NGINX_ASYNC_SUPPORTED
+    if (!async_mode) {
+        ngx_pool_cleanup_t *cln = ngx_pool_cleanup_add(request->pool, 0);
+        if (cln == NULL) return NULL;
+        cln->handler = ngx_cp_release_sync_session;
+        primary_sync_sessions++;
+    }
+#endif
 
     ngx_http_set_ctx(request, session_data, ngx_http_cp_attachment_module);
 
@@ -574,16 +605,11 @@ ngx_http_cp_req_header_handler_sync(ngx_http_request_t *request)
         return NGX_DECLINED;
     }
 
-    session_data_p = init_cp_session_data(request);
+    session_data_p = init_cp_session_data(request, 0);
     if (session_data_p == NULL) return NGX_DECLINED;
 
     set_current_session_id(session_data_p->session_id);
     write_dbg(DBG_LEVEL_DEBUG, "Request header filter handling session ID: %d", session_data_p->session_id);
-    session_data_p->initial_async_mode = 0;
-    if (is_ngx_cp_async_mode_enabled_for_request(request)) {
-        write_dbg(DBG_LEVEL_WARNING, "Async mode detected in sync filter - passing through");
-        return NGX_DECLINED;
-    }
 
     init_thread_ctx(&ctx, request, session_data_p, NULL);
     ctx.waf_tag = conf->waf_tag;
@@ -594,7 +620,7 @@ ngx_http_cp_req_header_handler_sync(ngx_http_request_t *request)
         return sessions_per_minute_verdict == TRAFFIC_VERDICT_ACCEPT ? NGX_DECLINED : NGX_ERROR;
     }
 
-    if (!get_already_registered() || !isIpcReady()) {
+    if (!get_already_registered() || !ngx_cp_primary_ipc_ready()) {
         if (is_registration_timeout_reached()) {
             write_dbg(DBG_LEVEL_DEBUG, "spawn ngx_http_cp_registration_thread");
             reset_registration_timeout();
@@ -630,8 +656,8 @@ ngx_http_cp_req_header_handler_sync(ngx_http_request_t *request)
             ctx.res
         );
         if (ctx.should_return) {
-            session_data_p->verdict = TRAFFIC_VERDICT_ACCEPT;
-            return ctx.res == NGX_OK ? NGX_DECLINED : ctx.res;
+            session_data_p->verdict = fail_mode_verdict == NGX_OK ? TRAFFIC_VERDICT_ACCEPT : TRAFFIC_VERDICT_DROP;
+            return fail_mode_verdict == NGX_OK ? NGX_DECLINED : fail_mode_verdict;
         }
     }
 
@@ -739,14 +765,9 @@ ngx_http_cp_req_body_filter_sync(ngx_http_request_t *request, ngx_chain_t *reque
 
     write_dbg(DBG_LEVEL_DEBUG, "Request body received [SYNC]");
 
-    if (session_data_p->initial_async_mode || (!session_data_p->initial_async_mode && is_ngx_cp_async_mode_enabled_for_request(request))) {
-        write_dbg(DBG_LEVEL_WARNING, "Async mode detected in sync filter - passing through");
-        return ngx_http_next_request_body_filter(request, request_body_chain);
-    }
-
     set_current_session_id(0);
 
-    if (!isIpcReady()) {
+    if (!ngx_cp_primary_ipc_ready()) {
         write_dbg(
             DBG_LEVEL_TRACE,
             "IPC is uninitialized. Skipping inspection of current request. Session id: %d",
@@ -1046,19 +1067,9 @@ ngx_http_cp_res_header_filter_core(ngx_http_request_t *request, int filter_mode)
 
     write_dbg(DBG_LEVEL_DEBUG, "Response header filter [%s] handling session ID: %d", filter_mode == ASYNC_FILTER ? "ASYNC" : "SYNC", session_data_p->session_id);
 
-    if (filter_mode == ASYNC_FILTER) {
-        if (!session_data_p->initial_async_mode || (session_data_p->initial_async_mode && !is_async_mode_enabled)) {
-            write_dbg(DBG_LEVEL_WARNING, "Async mode detected in sync filter - passing through");
-            return ngx_http_next_response_header_filter(request);
-        }
-    } else {
-        if (session_data_p->initial_async_mode || (!session_data_p->initial_async_mode && is_ngx_cp_async_mode_enabled_for_request(request))) {
-            write_dbg(DBG_LEVEL_WARNING, "Async mode detected in sync filter - passing through");
-            return ngx_http_next_response_header_filter(request);
-        }
-    }
-
-    if (!isIpcReady()) {
+    if (filter_mode == ASYNC_FILTER ?
+        (nano_service_secondary_sync_ipc == NULL || secondary_comm_socket < 0) :
+        !ngx_cp_primary_ipc_ready()) {
         write_dbg(
             DBG_LEVEL_TRACE,
             "IPC is uninitialized. Skipping inspection of current request. Session id: %d",
@@ -1069,11 +1080,6 @@ ngx_http_cp_res_header_filter_core(ngx_http_request_t *request, int filter_mode)
             return ngx_http_next_response_header_filter(request);
         }
         return NGX_ERROR;
-    }
-
-    if (filter_mode == ASYNC_FILTER && session_data_p->async_processing_needed == 0) {
-        write_dbg(DBG_LEVEL_DEBUG, "Async processing not needed - passing through");
-        return ngx_http_next_response_header_filter(request);
     }
 
     if (is_in_transparent_mode()) {
@@ -1094,7 +1100,7 @@ ngx_http_cp_res_header_filter_core(ngx_http_request_t *request, int filter_mode)
             return NGX_ERROR;
         }
         session_data_p->verdict = fail_mode_verdict == NGX_OK ? TRAFFIC_VERDICT_ACCEPT : TRAFFIC_VERDICT_DROP;
-        return ngx_http_next_response_header_filter(request);
+        return fail_mode_verdict == NGX_OK ? ngx_http_next_response_header_filter(request) : NGX_ERROR;
     }
 
     if (filter_mode == SYNC_FILTER && !session_data_p->was_request_fully_inspected) {
@@ -1102,11 +1108,11 @@ ngx_http_cp_res_header_filter_core(ngx_http_request_t *request, int filter_mode)
 
         handle_inspection_failure(inspection_failure_weight, fail_mode_verdict, session_data_p);
         updateMetricField(REQ_FAILED_TO_REACH_UPSTREAM, 1);
-        session_data_p->verdict = TRAFFIC_VERDICT_ACCEPT;
-        return ngx_http_next_response_header_filter(request);
+        session_data_p->verdict = fail_mode_verdict == NGX_OK ? TRAFFIC_VERDICT_ACCEPT : TRAFFIC_VERDICT_DROP;
+        return fail_mode_verdict == NGX_OK ? ngx_http_next_response_header_filter(request) : NGX_ERROR;
     }
 
-    if (filter_mode == SYNC_FILTER) request->filter_need_in_memory = 1;
+    request->filter_need_in_memory = 1;
 
     init_thread_ctx(&ctx, request, session_data_p, NULL);
     ctx.filter_mode = (filter_mode == ASYNC_FILTER) ? ASYNC_FILTER : SYNC_FILTER;
@@ -1228,22 +1234,12 @@ ngx_http_cp_res_body_filter_core(ngx_http_request_t *request, ngx_chain_t *body_
     was_recompressed = session_data_p->response_data.compression_stream != NULL;
     set_current_session_id(session_data_p->session_id);
     write_dbg(DBG_LEVEL_DEBUG, "Response body filter [%s] handling response ID: %d", filter_mode == ASYNC_FILTER ? "ASYNC" : "SYNC", session_data_p->session_id);
-    
+
     print_buffer_chain(body_chain, "incoming", 32, DBG_LEVEL_TRACE);
 
-    if (filter_mode == ASYNC_FILTER) {
-        if (!session_data_p->initial_async_mode || (session_data_p->initial_async_mode && !is_async_mode_enabled)) {
-            write_dbg(DBG_LEVEL_WARNING, "Async mode detected in sync filter - passing through");
-            return ngx_http_next_response_body_filter(request, body_chain);
-        }
-    } else {
-        if (session_data_p->initial_async_mode || (!session_data_p->initial_async_mode && is_ngx_cp_async_mode_enabled_for_request(request))) {
-            write_dbg(DBG_LEVEL_WARNING, "Async mode detected in sync filter - passing through");
-            return ngx_http_next_response_body_filter(request, body_chain);
-        }
-    }
-
-    if (!isIpcReady()) {
+    if (filter_mode == ASYNC_FILTER ?
+        (nano_service_secondary_sync_ipc == NULL || secondary_comm_socket < 0) :
+        !ngx_cp_primary_ipc_ready()) {
         write_dbg(
             DBG_LEVEL_TRACE,
             "IPC is uninitialized. Skipping inspection of current request. Session id: %d",
@@ -1256,11 +1252,6 @@ ngx_http_cp_res_body_filter_core(ngx_http_request_t *request, ngx_chain_t *body_
         }
         if (!was_recompressed) goto RESPONSE_BODY_PASSTHROUGH;
         /* Continue decoding below, then recompress without using IPC. */
-    }
-
-    if (filter_mode == ASYNC_FILTER && session_data_p->async_processing_needed == 0) {
-        write_dbg(DBG_LEVEL_DEBUG, "Async processing not needed - passing through");
-        return ngx_http_next_response_body_filter(request, body_chain);
     }
 
     if (session_data_p->response_data.response_data_status != NGX_OK) {
@@ -1329,7 +1320,7 @@ ngx_http_cp_res_body_filter_core(ngx_http_request_t *request, ngx_chain_t *body_
         )
     ) {
         write_dbg(
-            DBG_LEVEL_TRACE, 
+            DBG_LEVEL_TRACE,
             "Decompressing response body for session ID %d, compression type: %d, chunk: %d",
             session_data_p->session_id,
             session_data_p->response_data.new_compression_type,
@@ -1363,7 +1354,7 @@ ngx_http_cp_res_body_filter_core(ngx_http_request_t *request, ngx_chain_t *body_
                 if (fail_mode_verdict == NGX_OK) goto RESPONSE_BODY_PASSTHROUGH;
                 return ngx_http_filter_finalize_request(request, &ngx_http_cp_attachment_module, NGX_HTTP_FORBIDDEN);
             }
-            
+
             // Enforce minimum pool size to avoid issues with ngx_create_pool
             size_t actual_decomp_pool_size = decompression_pool_size < MIN_POOL_SIZE
                 ? MIN_POOL_SIZE
@@ -1466,7 +1457,7 @@ ngx_http_cp_res_body_filter_core(ngx_http_request_t *request, ngx_chain_t *body_
 
         handle_inspection_failure(inspection_failure_weight, fail_mode_verdict, session_data_p);
         updateMetricField(REQ_FAILED_TO_REACH_UPSTREAM, 1);
-        session_data_p->verdict = TRAFFIC_VERDICT_ACCEPT;
+        session_data_p->verdict = fail_mode_verdict == NGX_OK ? TRAFFIC_VERDICT_ACCEPT : TRAFFIC_VERDICT_DROP;
         goto RESPONSE_BODY_PASSTHROUGH;
     }
 
@@ -1785,12 +1776,12 @@ ngx_http_cp_res_body_filter(ngx_http_request_t *request, ngx_chain_t *body_chain
         res = ngx_http_cp_res_body_filter_sync(request, body_chain);
     }
 
-    if (is_async_toggled_off_in_last_reconfig()) {
+    if (is_async_toggled_off_in_last_reconfig() && !ngx_cp_async_has_pending_requests()) {
         disable_ipc_verdict_event_handler();
         reset_async_mode_toggled();
     }
 
-    if (is_async_toggled_on_in_last_reconfig()) {
+    if (is_async_toggled_on_in_last_reconfig() && ngx_cp_active_sync_sessions() == 0) {
         enable_ipc_verdict_event_handler();
         reset_async_mode_toggled();
     }

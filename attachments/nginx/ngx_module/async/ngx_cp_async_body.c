@@ -34,7 +34,7 @@ ngx_http_cp_res_body_filter_async(ngx_http_request_t *request, ngx_chain_t *body
     }
 
     set_current_session_id(session_data_p->session_id);
-    
+
     if (session_data_p->verdict != TRAFFIC_VERDICT_INSPECT) {
         write_dbg(DBG_LEVEL_TRACE, "Skipping already inspected session");
         if (session_data_p->verdict == TRAFFIC_VERDICT_DROP) {
@@ -55,137 +55,111 @@ ngx_http_cp_res_body_filter_async(ngx_http_request_t *request, ngx_chain_t *body
     return ngx_http_cp_res_body_filter_core(request, body_chain, ASYNC_FILTER);
 }
 
+/* Resolve a transport/context failure before releasing any queued bytes. */
+static ngx_int_t
+cp_async_body_failure(ngx_http_request_t *r, ngx_http_cp_session_data *sd,
+                      ngx_http_cp_async_ctx_t *ctx, ngx_chain_t *in)
+{
+    ngx_int_t rc = NGX_HTTP_FORBIDDEN;
+    sd->verdict = fail_mode_verdict == NGX_OK ? TRAFFIC_VERDICT_ACCEPT : TRAFFIC_VERDICT_DROP;
+    sd->async_processing_needed = 0;
+    sd->remaining_messages_to_reply = 0;
+    if (fail_mode_verdict == NGX_OK) {
+        if (ctx && ctx->queue_head) {
+            if (in && chain_add_copy(r, ctx, in) != NGX_OK) return NGX_ERROR;
+            rc = ngx_http_next_request_body_filter(r, ctx->queue_head);
+        } else {
+            rc = ngx_http_next_request_body_filter(r, in);
+        }
+    }
+    if (ctx) {
+        queue_free(r, ctx);
+        SAFE_DESTROY_CTX(ctx);
+    }
+    return rc;
+}
+
 ngx_int_t
 ngx_http_cp_req_body_filter_async(ngx_http_request_t *r, ngx_chain_t *in)
 {
     ngx_http_cp_session_data *sd = recover_cp_session_data(r);
     ngx_http_cp_async_ctx_t *ctx;
 
-    if (!sd) {
-        write_dbg(DBG_LEVEL_DEBUG, "No session data - passing through to next filter");
-        return ngx_http_next_request_body_filter(r, in);
-    }
-
-    write_dbg(DBG_LEVEL_TRACE, "Request body filter processing session %d", sd->session_id);
-
-    print_buffer_chain(in, "outgoing", 32, DBG_LEVEL_TRACE);
-    if (!sd->initial_async_mode || (sd->initial_async_mode && !is_async_mode_enabled)) {
-        write_dbg(DBG_LEVEL_WARNING, "Async mode not initialized or changed - passing through");
-        return ngx_http_next_request_body_filter(r, in);
-    }
-
-    if (!isIpcReady() || !sd->async_processing_needed) {
-        write_dbg(DBG_LEVEL_DEBUG, "No async processing needed - passing through");
-        return ngx_http_next_request_body_filter(r, in);
-    }
-
+    if (!sd) return ngx_http_next_request_body_filter(r, in);
+    /* The body reader flushes the filter chain each time it is resumed. Once the
+     * queued body including its last buffer has reached the save filter, a second
+     * empty flush would make it rewrite a file-backed body ("body already in file"). */
+    if (in == NULL && r->request_body && r->request_body->last_saved) return NGX_OK;
     ctx = ngx_cp_async_find_ctx(sd->session_id);
-    if (!ctx) {
-        write_dbg(DBG_LEVEL_DEBUG, "No async ctx; pass-through session %d", sd->session_id);
-        return ngx_http_next_request_body_filter(r, in);
-    }
 
-    if (sd->verdict != TRAFFIC_VERDICT_INSPECT) {
-        write_dbg(DBG_LEVEL_DEBUG, "Request already inspected; applying verdict for session %d", sd->session_id);
+    if (sd->verdict == TRAFFIC_VERDICT_DROP || sd->verdict == TRAFFIC_VERDICT_CUSTOM_RESPONSE) {
+        ServiceVerdict verdict = sd->verdict;
+        if (ctx) queue_free(r, ctx);
         SAFE_DESTROY_CTX(ctx);
-        return sd->verdict == TRAFFIC_VERDICT_ACCEPT ? ngx_http_next_request_body_filter(r, in) : NGX_HTTP_FORBIDDEN;
+        return verdict == TRAFFIC_VERDICT_CUSTOM_RESPONSE ?
+            ngx_http_cp_finalize_custom_response_request(r) : NGX_HTTP_FORBIDDEN;
     }
-
-    if (ngx_cp_async_ctx_get_flow_error_safe(ctx)) {
-        write_dbg(DBG_LEVEL_DEBUG, "Flow error detected for session %d", ngx_cp_async_ctx_get_session_id_safe(ctx));
+    if (sd->verdict == TRAFFIC_VERDICT_ACCEPT || sd->verdict == TRAFFIC_VERDICT_IRRELEVANT) {
+        ngx_int_t rc;
+        if (ctx && ctx->queue_head) {
+            if (in && chain_add_copy(r, ctx, in) != NGX_OK) return NGX_ERROR;
+            rc = ngx_http_next_request_body_filter(r, ctx->queue_head);
+            queue_free(r, ctx);
+        } else {
+            rc = ngx_http_next_request_body_filter(r, in);
+        }
         SAFE_DESTROY_CTX(ctx);
-        return ngx_http_next_request_body_filter(r, in);
+        return rc;
     }
 
-    if (!ctx->body_phase_started){
+    if (sd->body_processed) {
+        ngx_chain_t *cl;
+        for (cl = in; cl; cl = cl->next) {
+            if (cl->buf && ngx_buf_size(cl->buf) != 0) break;
+        }
+        if (cl == NULL) return ngx_http_next_request_body_filter(r, in);
+    }
+
+    if (!ctx || !ngx_cp_primary_ipc_ready() || !sd->initial_async_mode || ctx->flow_error ||
+        !sd->async_processing_needed) {
+        return cp_async_body_failure(r, sd, ctx, in);
+    }
+
+    if (!ctx->body_phase_started) {
         r->request_body->filter_need_buffering = 1;
-        r->request_body_no_buffering = 0;
         ctx->body_phase_started = 1;
     }
 
-    if (ngx_cp_async_ctx_get_released_safe(ctx) && ngx_cp_async_ctx_get_queue_head_safe(ctx)) {
-        write_dbg(DBG_LEVEL_DEBUG, "Forwarding queued body for released session %d", ngx_cp_async_ctx_get_session_id_safe(ctx));
-        ngx_int_t rc = ngx_http_next_request_body_filter(r, ctx->queue_head);
-        queue_free(r, ctx);
-        ctx->queue_head = ctx->queue_tail = NULL;
-        SAFE_DESTROY_CTX(ctx);
-        return rc;
-    }
-
-    if (!ctx->req_seq && ctx->queue_head && !in) {
-        write_dbg(DBG_LEVEL_DEBUG, "Forwarding queued body (no new data) for session %d", ctx->session_id);
-        ngx_int_t rc = ngx_http_next_request_body_filter(r, ctx->queue_head);
-        queue_free(r, ctx);
-        ctx->queue_head = ctx->queue_tail = NULL;
-        return rc;
-    }
-
+    /* Keep NGINX's original buffers busy until their verdict is available.
+     * Return OK so NGINX can update its busy chains and chunk parser state;
+     * filter_need_buffering makes the reader yield while these buffers are held.
+     * This also covers chunked uploads whose final buffer has no body bytes. */
     if (in) {
-        write_dbg(DBG_LEVEL_TRACE, "Processing body chunk for session %d", ctx->session_id);
-
-        if (chain_add_copy(r, ctx, in) != NGX_OK) {
-            write_dbg(DBG_LEVEL_ERROR, "Failed to queue body chunk for session %d", ctx->session_id);
-            ctx->session_data->async_processing_needed = 0;
-            queue_free(r, ctx);
-            ctx->queue_head = ctx->queue_tail = NULL;
-            SAFE_DESTROY_CTX(ctx);
-            return NGX_ERROR;
-        }
-
+        if (ctx->queue_head == NULL) ctx->queue_first_part_index = ctx->body_part_index;
+        if (chain_add_copy(r, ctx, in) != NGX_OK) return NGX_ERROR;
         for (ngx_chain_t *cl = in; cl; cl = cl->next) {
+            ngx_uint_t nmsgs = 0;
             ngx_buf_t *b = cl->buf;
             if (b == NULL) continue;
-
-            ngx_uint_t nmsgs = 0;
-            ngx_int_t rc = NGX_OK;
             if (ngx_cp_async_send_single_body_chunk_nonblocking(ctx, cl, &nmsgs) != NGX_OK) {
-                write_dbg(DBG_LEVEL_DEBUG, "IPC send failed; fail-safe pass-through session %d", ctx->session_id);
-                if (ctx->queue_head) {
-                    rc = ngx_http_next_request_body_filter(r, ctx->queue_head);
-                    ctx->session_data->async_processing_needed = 0;
-                    queue_free(r, ctx);
-                    ctx->queue_head = ctx->queue_tail = NULL;
-                }
-                SAFE_DESTROY_CTX(ctx);
-                return rc;
+                return cp_async_body_failure(r, sd, ctx, NULL);
             }
             ctx->req_seq += nmsgs;
             sd->remaining_messages_to_reply += nmsgs;
-
-            if (b->last_buf) {
+            if (b->last_buf && !ctx->end_transaction_sent) {
                 if (ngx_cp_async_send_end_transaction_nonblocking(ctx, &nmsgs) != NGX_OK) {
-                    write_dbg(DBG_LEVEL_DEBUG, "IPC send failed; fail-safe pass-through session %d", ctx->session_id);
-                    if (ctx->queue_head) {
-                        rc = ngx_http_next_request_body_filter(r, ctx->queue_head);
-                        queue_free(r, ctx);
-                        ctx->queue_head = ctx->queue_tail = NULL;
-                    }
-                    SAFE_DESTROY_CTX(ctx);
-                    return rc;
+                    return cp_async_body_failure(r, sd, ctx, NULL);
                 }
                 ctx->req_seen_last = 1;
                 ctx->req_seq += nmsgs;
                 sd->remaining_messages_to_reply += nmsgs;
-                write_dbg(DBG_LEVEL_DEBUG, "Received last body chunk for session %d", ctx->session_id);
             }
         }
-        
-        if (ctx->req_seen_last == 1) {
-            write_dbg(DBG_LEVEL_DEBUG, "Waiting for verdict after last chunk, session %d", ctx->session_id);
-            ngx_cp_async_start_deadline_timer(ctx, ngx_max(req_max_proccessing_ms_time, async_body_stage_timeout));
-            ctx->waiting  = 1;
-            
-            if (!ctx->request_ref_incremented && r->http_version == NGX_HTTP_VERSION_20) {
-                r->main->count++;
-                ctx->request_ref_incremented = 1;
-                write_dbg(DBG_LEVEL_TRACE, "Incremented reference count for HTTP/2 session %d", ctx->session_id);
-            }
-            
-            return NGX_DONE;
+        ctx->waiting = 1;
+        ngx_cp_async_start_deadline_timer(ctx, ngx_max(req_max_proccessing_ms_time, async_body_stage_timeout));
+        if (ctx->req_seq == 0 && sd->verdict != TRAFFIC_VERDICT_DELAYED) {
+            ngx_cp_async_event_handler(&ctx->agent_event);
         }
-        return ngx_http_next_request_body_filter(r, NULL);
     }
-
-    write_dbg(DBG_LEVEL_TRACE, "No new input for session %d", ctx->session_id);
-    return ngx_http_next_request_body_filter(r, in);
+    return ctx->queue_head || ctx->req_seq ? NGX_OK : ngx_http_next_request_body_filter(r, NULL);
 }

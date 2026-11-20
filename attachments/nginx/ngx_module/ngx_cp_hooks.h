@@ -55,7 +55,7 @@ typedef struct ngx_http_cp_session_data {
     ngx_int_t              is_res_body_inspected; ///< Holds if the response body was inspected
     ngx_int_t              async_processing_needed; ///< Holds if async processing is needed in filters
     ngx_int_t              body_processed; ///< Holds if request body processing is complete
-    ngx_int_t              initial_async_mode; ///< Initial async mode for this request (0=sync, 1=async, -1=unset)
+    ngx_int_t              initial_async_mode; ///< Session mode, fixed before agent communication (0=sync, 1=async)
 } ngx_http_cp_session_data;
 
 ///
@@ -148,7 +148,11 @@ ServiceVerdict enforce_sessions_rate();
 ngx_int_t ngx_http_cp_request_and_response_size_handler(ngx_http_request_t *request);
 
 // Session management functions
-ngx_http_cp_session_data *init_cp_session_data(ngx_http_request_t *request);
+ngx_int_t ngx_cp_primary_ipc_ready(void);
+ngx_http_cp_session_data *init_cp_session_data(ngx_http_request_t *request, ngx_int_t async_mode);
+#ifdef NGINX_ASYNC_SUPPORTED
+ngx_uint_t ngx_cp_active_sync_sessions(void);
+#endif
 ngx_http_cp_session_data *recover_cp_session_data(ngx_http_request_t *request);
 
 // Utility functions

@@ -37,6 +37,8 @@ typedef struct ngx_http_cp_async_ctx {
     unsigned                           body_phase_started:1; ///< Flag to indicate if body phase started
     unsigned                           released:1;           ///< Flag to indicate if request is released
     unsigned                           req_seen_last:1;      ///< Flag to indicate if last chunk seen
+    ngx_uint_t                         queue_first_part_index; ///< First buffer index in the pending batch
+    ngx_uint_t                         body_part_index;      ///< Body buffer index across filter calls (wire: uint8_t)
     ngx_uint_t                         req_seq;              ///< Request body chunk sequence number
     ngx_chain_t                       *queue_head;           ///< Saved chains to forward later
     ngx_chain_t                       *queue_tail;           ///< Tail of saved chains
@@ -57,6 +59,7 @@ typedef struct ngx_http_cp_async_ctx {
 /// @return NGX_OK on success, NGX_ERROR on failure
 ///
 ngx_int_t ngx_cp_async_init();
+ngx_int_t ngx_cp_async_has_pending_requests(void);
 
 ///
 /// @brief Cleanup the async connection management system
@@ -120,7 +123,7 @@ ngx_int_t ngx_cp_async_continue_processing(ngx_http_cp_async_ctx_t *ctx);
 ///
 /// @brief Start deadline timer for current stage
 /// @param[in] ctx Async context
-/// @param[in] timeout_ms Timeout in milliseconds  
+/// @param[in] timeout_ms Timeout in milliseconds
 /// @return NGX_OK on success, NGX_ERROR on failure
 ///
 ngx_int_t ngx_cp_async_start_deadline_timer(ngx_http_cp_async_ctx_t *ctx, ngx_msec_t timeout_ms);

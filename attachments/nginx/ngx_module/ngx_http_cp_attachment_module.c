@@ -301,6 +301,12 @@ is_ngx_cp_async_mode_enabled_for_request(ngx_http_request_t *request)
     is_async_mode_enabled = 0;
     return 0;
 #else
+    ngx_http_cp_session_data *session = recover_cp_session_data(request);
+    if (session != NULL) return session->initial_async_mode == 1;
+    /* Primary IPC has one reader. Drain existing sessions before changing it. */
+    if (ngx_cp_active_sync_sessions() != 0) return 0;
+    if (ngx_cp_async_has_pending_requests()) return 1;
+
     if (is_async_mode_enabled) {
         return 1;
     }
@@ -309,7 +315,7 @@ is_ngx_cp_async_mode_enabled_for_request(ngx_http_request_t *request)
         is_async_mode_enabled = 1;
         return 1;
     }
-    
+
     ngx_cp_attachment_conf_t *conf = ngx_http_get_module_loc_conf(request, ngx_http_cp_attachment_module);
     if (conf != NULL && conf->async_mode != NGX_CONF_UNSET) {
         if (conf->async_mode) {
@@ -481,7 +487,7 @@ ngx_cp_attachment_init_worker(ngx_cycle_t *cycle)
 {
     ngx_core_conf_t *core_main_conf;
     ngx_cp_attachment_conf_t *attachment_conf;
-    
+
     init_global_logging_data();
 
     write_dbg(DBG_LEVEL_INFO, "entering init worker. ngx_exiting=%d", ngx_exiting);
@@ -524,7 +530,7 @@ ngx_cp_attachment_init_worker(ngx_cycle_t *cycle)
             timer_interval_msec
         );
 
-        init_attachment_registration_thread();        
+        init_attachment_registration_thread();
     }
 
     ngx_cp_init_env_async_mode();
@@ -552,7 +558,7 @@ ngx_cp_attachment_fini_worker(ngx_cycle_t *cycle)
     // the single instance of the timer and destroy it)
     if (ngx_worker == 0) {
         reset_attachment_registration();
-    
+
         (void)cycle;
         if (is_timer_active) ngx_del_timer(&ngx_keep_alive_event);
         write_dbg(DBG_LEVEL_INFO, "Timer successfully deleted");
@@ -571,7 +577,7 @@ ngx_cp_attachment_init(ngx_conf_t *conf)
     ngx_http_handler_pt *handler;
     ngx_http_handler_pt *size_metrics_handler;
     ngx_http_core_main_conf_t *http_core_main_conf;
-    
+
     write_dbg(DBG_LEVEL_DEBUG, "Setting the memory pool used in the current context");
     if (conf->pool == NULL) {
         write_dbg(
@@ -598,7 +604,7 @@ ngx_cp_attachment_init(ngx_conf_t *conf)
     // Set handler based on async mode configuration
     write_dbg(DBG_LEVEL_DEBUG, "Setting unified handlers with dynamic async mode support");
     *handler = ngx_http_cp_req_header_handler;
-    
+
     ngx_http_next_request_body_filter = ngx_http_top_request_body_filter;
     ngx_http_top_request_body_filter = ngx_http_cp_req_body_filter;
 
