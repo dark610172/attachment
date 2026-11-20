@@ -97,7 +97,7 @@ ngx_http_cp_req_body_filter_async(ngx_http_request_t *r, ngx_chain_t *in)
         if (ctx) queue_free(r, ctx);
         SAFE_DESTROY_CTX(ctx);
         return verdict == TRAFFIC_VERDICT_CUSTOM_RESPONSE ?
-            ngx_http_cp_finalize_custom_response_request(r) : NGX_HTTP_FORBIDDEN;
+            ngx_http_cp_reject_from_req_body_filter(r, 1) : NGX_HTTP_FORBIDDEN;
     }
     if (sd->verdict == TRAFFIC_VERDICT_ACCEPT || sd->verdict == TRAFFIC_VERDICT_IRRELEVANT) {
         ngx_int_t rc;

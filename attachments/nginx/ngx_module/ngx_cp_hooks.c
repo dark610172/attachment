@@ -752,6 +752,22 @@ clear_body_sender(ngx_http_cp_session_data *session)
 }
 
 ngx_int_t
+ngx_http_cp_reject_from_req_body_filter(ngx_http_request_t *request, ngx_int_t is_custom_response)
+{
+#if (NGX_HTTP_V2)
+    /* HTTP/2 passes a body that arrives in a later DATA frame through this filter and then
+     * finalizes the stream again with the filter's return code. The finalizers below already
+     * finalize the request, so with one reference left the request would be closed twice
+     * (use after free, "http request count is zero"). Keep a reference for NGINX's call.
+     * During the first read the body reader holds its own reference, so count is above 1. */
+    if (request->stream != NULL && request->main->count == 1) request->main->count++;
+#endif
+    return is_custom_response ?
+        ngx_http_cp_finalize_custom_response_request(request) :
+        ngx_http_cp_finalize_rejected_request(request, 0);
+}
+
+ngx_int_t
 ngx_http_cp_req_body_filter_sync(ngx_http_request_t *request, ngx_chain_t *request_body_chain)
 {
     struct ngx_http_cp_event_thread_ctx_t ctx;
@@ -905,7 +921,7 @@ ngx_http_cp_req_body_filter_sync(ngx_http_request_t *request, ngx_chain_t *reque
                     "Received NGX_HTTP_FORBIDDEN with TRAFFIC_VERDICT_CUSTOM_RESPONSE for session ID: %d, returning Custom Response",
                     session_data_p->session_id
                 );
-                return ngx_http_cp_finalize_custom_response_request(request);
+                return ngx_http_cp_reject_from_req_body_filter(request, 1);
             }
 
             if (session_data_p->verdict == TRAFFIC_VERDICT_DELAYED) {
@@ -961,13 +977,13 @@ ngx_http_cp_req_body_filter_sync(ngx_http_request_t *request, ngx_chain_t *reque
 REQUEST_BODY_INSPECTION_DONE:
     clear_body_sender(session_data_p);
     if (session_data_p->verdict == TRAFFIC_VERDICT_CUSTOM_RESPONSE) {
-        return ngx_http_cp_finalize_custom_response_request(request);
+        return ngx_http_cp_reject_from_req_body_filter(request, 1);
     }
     final_res = ctx.res;
 
     if (final_res == NGX_HTTP_FORBIDDEN) {
         handle_inspection_success(session_data_p);
-        return ngx_http_cp_finalize_rejected_request(request, 0);
+        return ngx_http_cp_reject_from_req_body_filter(request, 0);
     }
 
     if (final_res != NGX_OK) {

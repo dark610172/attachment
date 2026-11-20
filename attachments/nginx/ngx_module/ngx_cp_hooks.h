@@ -166,6 +166,14 @@ ngx_int_t ngx_http_cp_finalize_request_headers_hook(
 // Sync and async handlers
 ngx_int_t ngx_http_cp_req_header_handler_sync(ngx_http_request_t *request);
 ngx_int_t ngx_http_cp_req_body_filter_sync(ngx_http_request_t *request, ngx_chain_t *request_body_chain);
+
+///
+/// @brief Rejects a request from inside the request body filter (sends the block response).
+/// @param[in, out] request NGINX request.
+/// @param[in] is_custom_response 1 for the custom response, 0 for the block page.
+/// @returns ngx_int_t value to return from the body filter.
+///
+ngx_int_t ngx_http_cp_reject_from_req_body_filter(ngx_http_request_t *request, ngx_int_t is_custom_response);
 ngx_int_t ngx_http_cp_res_body_filter_sync(ngx_http_request_t *request, ngx_chain_t *body_chain);
 ngx_int_t ngx_http_cp_res_body_filter_core(ngx_http_request_t *request, ngx_chain_t *body_chain, int filter_mode);
 ngx_int_t ngx_http_cp_res_header_filter_sync(ngx_http_request_t *request);
