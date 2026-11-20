@@ -47,6 +47,7 @@
 | fbecc65 | async：header INJECT 正確套用；CUSTOM_RESPONSE 用正確的回應函式；第二次 INJECT 不再存取空指標 | N15、N16、N03 |
 | fbecc65 | async：沒有 header 的請求送出正確的空 header 訊息；HTTP/2 多加的參照計數只釋放一次 | N04、N13 |
 | fbecc65 | async：最後一段 body 存好後，不再把空的呼叫往下傳（原本會讓暫存檔的 body 回 500） | 修正過程中發現 |
+| 7b7a2bf | gzip/zlib 解壓縮輸出上限 256 MB（和 Brotli 相同）。從 Kong 版分支移植，NGINX 模組也連結這個共用函式庫 | Kong 版問題 |
 
 ## 四、實測結果
 
@@ -91,6 +92,21 @@ gzip 回應、快取命中回應、Content-Type 回應都正常。整個測試�
 
 1. **worker 註冊期間 fail-open**：nginx 啟動或 reload 後，每個 worker 在和 agent 註冊完成前的請求，會依 fail-open 放行。官方映像也一樣（8 個 worker，16 個請求放行 8 個）。設成 fail-closed 會擋下。
 2. **agent 重啟後約 1 分鐘**：agent 剛重啟時，body 攻擊會被放行，約 60 秒後恢復。官方映像也一樣。
+
+### 4.4 Kong 版找到的問題，在 NGINX 版的檢查結果
+
+Kong 版分支（`fix/kong-plugin-header-leak-and-chunked-bypass`）修了 9 個問題。下表是同樣的問題在 NGINX 模組的實測或程式碼檢查結果。原版與修正版結果相同的，表示 NGINX 版本來就沒有這個問題。
+
+| Kong 版問題 | NGINX 版結果 | 檢查方式 |
+|---|---|---|
+| chunked body 不檢查 | 沒有這個問題。原版與修正版的 chunked SQLi 都回 403，正常 chunked 回 200 | 實測 |
+| 每個 header 漏記憶體 | 沒有這個問題。每個請求多 8 個 header，跑約 116 萬個請求，worker 記憶體維持在 55 MB 上下（變動小於 0.2 MB） | 實測 3 分鐘 |
+| header 數量超過 1000 時越界讀取 | 沒有這個問題。nginx 1.30 本身會拒絕超過約 1000 個 header 的請求（回 400），模組收不到。990 個 header 加攻擊仍回 403，之後的請求也正常。模組依 nginx 的清單逐一處理 header，沒有固定 1000 格的陣列 | 實測與程式碼檢查 |
+| 沒有 session 的回應讓 header 階段出錯 | 沒有這個問題。nginx 自己回的 400、414、505（亂碼請求、20 KB 網址、錯誤 Host、錯誤 HTTP 版本）都正常，之後的請求與攻擊判定都正常，沒有當掉 | 實測 |
+| async 沒有 body 的請求多送一次結束訊息 | 沒有這個問題。結束訊息只在一個地方送出，並用旗標防止重送。暖機後，原版與修正版 async 的 GET 都約 3 ms | 實測與程式碼檢查 |
+| gzip 解壓縮沒有上限 | **有這個問題**。NGINX 模組連結同一個共用解壓縮函式庫。已移植修正（7b7a2bf） | 程式碼檢查。這個 agent 不檢查回應 body，所以實機觸發不到 |
+| debug log 格式字串多一個逗號 | 不適用。這是 Kong 用的 `nano_attachment` 程式碼，NGINX 模組有自己的設定讀取 | 程式碼檢查 |
+| 每個請求做完整 GC、外掛優先順序 | 不適用。只存在於 Kong 的 Lua 外掛 | — |
 
 ## 五、效能
 
