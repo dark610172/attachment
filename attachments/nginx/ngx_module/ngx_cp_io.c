@@ -773,9 +773,16 @@ ngx_http_cp_reply_receiver(
             }
 
             case TRAFFIC_VERDICT_IRRELEVANT: {
-                // After an irrelevant verdict, ignore the verdict and continue to the next response.
+                // A terminal body verdict must stop partial-buffer continuation.
                 write_dbg(DBG_LEVEL_DEBUG, "Verdict irrelevant received from the nano service");
                 updateMetricField(IRRELEVANT_VERDICTS_COUNT, 1);
+                if (chunk_type == REQUEST_BODY || chunk_type == RESPONSE_BODY ||
+                    chunk_type == REQUEST_END || chunk_type == RESPONSE_END ||
+                    chunk_type == REQUEST_DELAYED_VERDICT) {
+                    *expected_replies = 0;
+                    free_data_from_service(filter_mode);
+                    return NGX_OK;
+                }
                 break;
             }
 
@@ -788,7 +795,7 @@ ngx_http_cp_reply_receiver(
             }
 
             case TRAFFIC_VERDICT_INSPECT: {
-                // After an irrelevant verdict, ignore the verdict and continue to the next response.
+                // Continue inspecting the next response.
                 write_dbg(DBG_LEVEL_DEBUG, "Verdict inspect received from the nano service");
                 updateMetricField(INSPECT_VERDICTS_COUNT, 1);
                 break;
@@ -1437,6 +1444,10 @@ ngx_http_cp_body_sender(
     }
 
 done:
+    if (res != NGX_OK) {
+        session_data->body_sender_chain = NULL;
+        session_data->body_sender_offset = 0;
+    }
     *num_messages_sent = num_parts_sent;
     *next_elem_to_inspect = chain_iter;
     return res;
