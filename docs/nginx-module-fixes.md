@@ -7,7 +7,8 @@
 3. 修正後，1m 和 8k 兩種緩衝大小，12 項攻擊與正常請求測試全部正確。1 MB、50 MB、300 MB 上傳的內容雜湊值都一致。
 4. 另外修了 17 個原始碼審查找到的問題，包含記憶體錯誤、判定處理錯誤和 async 模式的檢查漏洞。
 5. async 模式在預設 CMake 建置裡沒有編入。我們另外打開它建置並實測：上游版本在 async 模式下也會漏擋 body 攻擊，修正後暖機狀態全部擋下。
-6. 效能和原版差不多，數字見第五節。
+6. 原版在 HTTP/2 請求的 body 被擋時，會把同一個請求結束兩次，使用已釋放的記憶體，worker 偶爾會當掉。修正版已修，見 4.5。
+7. 效能和原版差不多，數字見第五節。
 
 ## 二、範圍與測試環境
 
@@ -48,6 +49,7 @@
 | fbecc65 | async：沒有 header 的請求送出正確的空 header 訊息；HTTP/2 多加的參照計數只釋放一次 | N04、N13 |
 | fbecc65 | async：最後一段 body 存好後，不再把空的呼叫往下傳（原本會讓暫存檔的 body 回 500） | 修正過程中發現 |
 | 7b7a2bf | gzip/zlib 解壓縮輸出上限 256 MB（和 Brotli 相同）。從 Kong 版分支移植，NGINX 模組也連結這個共用函式庫 | Kong 版問題 |
+| 10bfe5b | HTTP/2 請求在 body 階段被擋時，不再被結束兩次（原本是使用已釋放的記憶體，worker 會當掉） | 審查 async commit 時實測發現 |
 
 ## 四、實測結果
 
@@ -90,7 +92,7 @@ gzip 回應、快取命中回應、Content-Type 回應都正常。整個測試�
 
 ### 4.3 兩個和模組無關、但部署時要注意的行為
 
-1. **worker 註冊期間 fail-open**：nginx 啟動或 reload 後，每個 worker 在和 agent 註冊完成前的請求，會依 fail-open 放行。官方映像也一樣（8 個 worker，16 個請求放行 8 個）。設成 fail-closed 會擋下。
+1. **worker 註冊期間 fail-open**：nginx 啟動或 reload 後，每個 worker 在和 agent 註冊完成前的請求，會依 fail-open 放行。官方映像也一樣（8 個 worker，16 個請求放行 8 個）。reload 後放行的時間約幾秒到 20 秒。設成 fail-closed 會擋下。
 2. **agent 重啟後約 1 分鐘**：agent 剛重啟時，body 攻擊會被放行，約 60 秒後恢復。官方映像也一樣。
 
 ### 4.4 Kong 版找到的問題，在 NGINX 版的檢查結果
@@ -107,6 +109,29 @@ Kong 版分支（`fix/kong-plugin-header-leak-and-chunked-bypass`）修了 9 個
 | gzip 解壓縮沒有上限 | **有這個問題**。NGINX 模組連結同一個共用解壓縮函式庫。已移植修正（7b7a2bf） | 程式碼檢查。這個 agent 不檢查回應 body，所以實機觸發不到 |
 | debug log 格式字串多一個逗號 | 不適用。這是 Kong 用的 `nano_attachment` 程式碼，NGINX 模組有自己的設定讀取 | 程式碼檢查 |
 | 每個請求做完整 GC、外掛優先順序 | 不適用。只存在於 Kong 的 Lua 外掛 | — |
+
+### 4.5 HTTP/2（h2c）
+
+設定：`http2 on;`，客戶端用 HTTP/2 直接連線（不經 TLS），`client_body_buffer_size 8k`。
+
+| 項目 | 原版 | 修正版 |
+|---|---|---|
+| 小 body 攻擊（30 次） | 403 | 403 |
+| 300 KB body 尾端攻擊（10 次） | 403 | 403 |
+| 300 KB 正常 body（10 次） | 200 | 200 |
+| nginx 警告「http request count is zero」 | 每次測試 26 到 39 次（每個被擋的 HTTP/2 POST 一次） | 0 次 |
+| worker 當掉 | 兩次測試各 1 次 | 0 次 |
+| 750 個被擋的 HTTP/2 請求後的檔案描述元與記憶體 | — | 檔案描述元 185 到 188，記憶體升到 56.7 MB 後不再增加 |
+
+原因：body 在後面的 HTTP/2 DATA 框架才到時，nginx 會在 body filter 回傳後再結束一次請求。模組擋下請求時自己已經結束了請求，所以請求被結束兩次，第二次使用的是已經釋放的記憶體。worker 當掉後，新的 worker 在註冊完成前會依 fail-open 放行（見 4.3），所以這也會讓攻擊在短時間內通過。HTTP/1 不受影響。
+
+async 模式（上游 async 與修正版 async 比較）：
+
+| 項目 | 上游 async | 修正版 async |
+|---|---|---|
+| 小 body 攻擊（30 次） | 放行 4 個 | 放行 0 個 |
+| 300 KB 正常 body（10 次） | 10 個被誤擋 | 10 個 200 |
+| reload 時 nginx 警告「open socket left」 | 有 | 有（見第六節） |
 
 ## 五、效能
 
@@ -133,6 +158,9 @@ Kong 版分支（`fix/kong-plugin-header-leak-and-chunked-bypass`）修了 9 個
 | 重新壓縮輸出沒有上限 | 審查指出：`proxy_buffering off` 加上慢速客戶端時，記憶體會隨回應大小成長。沒有修，原因同上，實機觸發不到 |
 | N18（索引 8 位元回繞）、N19（subrequest 與 trailer）、N20（session ID 重複） | 屬於疑點，需要 agent 端的行為才能判斷，沒有修 |
 | async 的 N07、N13、N15、N16 | 已修，但需要 agent 回傳特定判定才能觸發，只做了程式碼檢查與編譯 |
+| async 模式 reload 時的「open socket left」警告 | 沒有修。這是模組自己和 agent 之間的連線，worker 結束時沒有關掉。上游也一樣，只在 worker 結束時出現，不是請求洩漏 |
+| agent 重啟後約 10 分鐘內，偶爾有 HTTP/2 攻擊放行 | 沒有找到原因。兩次測試分別放行 4 個與 1 個；之後修正版連續約 200 個 HTTP/2 攻擊全部擋下，沒有重現 |
+| async 程式碼審查 | 自己審查了 fbecc65，沒有找到確定的錯誤。Codex 審查因額度用完排在之後 |
 | agent 的誤判 | agent 會把 1 MB 以上的隨機二進位、重複單字的大 body、路徑 `/echo` 判成攻擊。這是 agent 的判斷，和模組無關 |
 
 ## 七、建置方式
