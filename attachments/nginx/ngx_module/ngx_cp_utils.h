@@ -337,11 +337,15 @@ typedef struct CustomResponseHeader {
 /// @param[in] body Sets the response body.
 /// @param[in] response_code Sets the response code of the custom response.
 /// @param[in] headers Linked list of headers to set.
+/// @param[in] pool Owns the response data; ownership transfers on success.
+/// @returns ngx_int_t NGX_OK on success, NGX_ERROR on allocation failure.
 ///
-void set_custom_response(const ngx_str_t *body, ngx_uint_t response_code, CustomResponseHeader *headers);
+ngx_int_t set_custom_response(
+    const ngx_str_t *body, ngx_uint_t response_code, CustomResponseHeader *headers, ngx_pool_t *pool
+);
 
 ///
-/// @brief Free custom response headers.
+/// @brief Free the stored custom response and its headers.
 ///
 void free_custom_response_headers(void);
 

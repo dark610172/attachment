@@ -271,9 +271,18 @@ ngx_http_cp_finalize_custom_response_request(ngx_http_request_t *request)
         }
         
         h->key.len = header->key.len;
-        h->key.data = header->key.data;
+        h->key.data = ngx_pnalloc(request->pool, h->key.len + 1);
         h->value.len = header->value.len;
-        h->value.data = header->value.data;
+        h->value.data = ngx_pnalloc(request->pool, h->value.len + 1);
+        if (h->key.data == NULL || h->value.data == NULL) {
+            h->hash = 0;
+            write_dbg(DBG_LEVEL_WARNING, "Failed to copy custom response header");
+            goto CUSTOM_RESPONSE_OUT;
+        }
+        ngx_memcpy(h->key.data, header->key.data, h->key.len);
+        h->key.data[h->key.len] = 0;
+        ngx_memcpy(h->value.data, header->value.data, h->value.len);
+        h->value.data[h->value.len] = 0;
         h->hash = 1;
         
         write_dbg(
@@ -763,15 +772,16 @@ perform_header_modification(
         }
         case INJECT: {
             // Injects a modification into the header.
+            init_list_iterator(headers, headers_iterator);
             injected_header = get_list_element(headers_iterator, modification->modification.orig_buff_index);
             if (injected_header == NULL) {
                 // No header found with the index.
                 write_dbg(
-                    DBG_LEVEL_ASSERT,
-                    "No header found with index %ui",
+                    DBG_LEVEL_WARNING,
+                    "Skipping header modification: no header found with index %ui",
                     modification->modification.orig_buff_index
-                )
-                return NGX_ERROR;
+                );
+                return NGX_OK;
             }
 
             if (inject_header_value(injected_header, modification, headers->pool) != NGX_OK) {
@@ -919,7 +929,6 @@ ngx_http_cp_body_modifier(
 )
 {
     static const size_t MAX_MODIFICATIONS_PER_CHUNK = 64;
-    ngx_http_cp_modification_list *next_modification;
     ngx_uint_t cur_body_chunk = 0;
     ngx_chain_t *chain_iter;
     size_t cur_chunk_size = 0;
@@ -944,6 +953,7 @@ ngx_http_cp_body_modifier(
             modification_count++;
             temp_mod = temp_mod->next;
         }
+        ngx_http_cp_modification_list *next_chunk_modification = temp_mod;
         
         if (modification_count == 0) {
             continue;
@@ -1013,11 +1023,10 @@ ngx_http_cp_body_modifier(
         chain_iter->buf->end = current_buffer + current_size;
 
         for (ngx_uint_t i = 0; i < modification_count; i++) {
-            next_modification = modifications_for_chunk[i]->next;
             ngx_pfree(pool, modifications_for_chunk[i]->modification_buffer);
             ngx_pfree(pool, modifications_for_chunk[i]);
-            curr_modification = next_modification;
         }
+        curr_modification = next_chunk_modification;
     }
     return NGX_OK;
 }

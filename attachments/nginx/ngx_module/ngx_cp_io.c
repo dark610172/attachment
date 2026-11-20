@@ -368,10 +368,10 @@ handle_custom_response(HttpCustomResponseData *custom_response_data)
     }
 
     char *data_ptr = custom_response_data->data;
-    ngx_pool_t *pool = get_memory_pool();
+    ngx_pool_t *pool = ngx_create_pool(NGX_DEFAULT_POOL_SIZE, ngx_cycle->log);
 
     if (!pool) {
-        write_dbg(DBG_LEVEL_WARNING, "Failed to get NGINX memory pool");
+        write_dbg(DBG_LEVEL_WARNING, "Failed to create custom response pool");
         return NGX_ERROR;
     }
     
@@ -391,7 +391,7 @@ handle_custom_response(HttpCustomResponseData *custom_response_data)
         );
         if (current_header == NULL) {
             write_dbg(DBG_LEVEL_WARNING, "Failed to allocate memory for header node");
-            free_custom_response_headers();
+            ngx_destroy_pool(pool);
             return NGX_ERROR;
         }
 
@@ -399,8 +399,7 @@ handle_custom_response(HttpCustomResponseData *custom_response_data)
         current_header->key.data = ngx_pcalloc(pool, header_data->key_size + 1);
         if (current_header->key.data == NULL) {
             write_dbg(DBG_LEVEL_WARNING, "Failed to allocate memory for header key");
-            ngx_pfree(pool, current_header);
-            free_custom_response_headers();
+            ngx_destroy_pool(pool);
             return NGX_ERROR;
         }
         ngx_memcpy(current_header->key.data, header_data->data, header_data->key_size);
@@ -410,9 +409,7 @@ handle_custom_response(HttpCustomResponseData *custom_response_data)
         current_header->value.data = ngx_pcalloc(pool, header_data->value_size + 1);
         if (current_header->value.data == NULL) {
             write_dbg(DBG_LEVEL_WARNING, "Failed to allocate memory for header value");
-            ngx_pfree(pool, current_header->key.data);
-            ngx_pfree(pool, current_header);
-            free_custom_response_headers();
+            ngx_destroy_pool(pool);
             return NGX_ERROR;
         }
         ngx_memcpy(
@@ -455,7 +452,10 @@ handle_custom_response(HttpCustomResponseData *custom_response_data)
         custom_response_data->headers_count
     );
 
-    set_custom_response(&response_body, custom_response_data->response_code, headers_list);
+    if (set_custom_response(&response_body, custom_response_data->response_code, headers_list, pool) != NGX_OK) {
+        ngx_destroy_pool(pool);
+        return NGX_ERROR;
+    }
 
     return NGX_OK;
 }
@@ -811,7 +811,7 @@ ngx_http_cp_reply_receiver(
                 // Custom Response verdict received from the nano service.
                 write_dbg(DBG_LEVEL_DEBUG, "Verdict Custom Response received from the nano service");
 
-                handle_custom_response(reply_p->modify_data->custom_response_data);
+                res = handle_custom_response(reply_p->modify_data->custom_response_data);
 
                 *expected_replies = 0;
                 free_data_from_service(filter_mode);
@@ -820,6 +820,11 @@ ngx_http_cp_reply_receiver(
                     *modification_list = (*modification_list)->next;
                     ngx_pfree(request->pool, current_modification->modification.data);
                     ngx_pfree(request->pool, current_modification);
+                }
+                if (res != NGX_OK) {
+                    write_dbg(DBG_LEVEL_WARNING, "Failed to prepare custom response, applying failure policy");
+                    *verdict = fail_mode_verdict == NGX_OK ? TRAFFIC_VERDICT_ACCEPT : TRAFFIC_VERDICT_DROP;
+                    return NGX_ERROR;
                 }
                 return NGX_OK;
             }
