@@ -40,5 +40,6 @@ With a larger policy that also loads Snort rules, the 1.1.36 image also passed a
 
 - The stack uses port 18081 (`E2E_PORT`) and state in `~/.cache/ngx-e2e` (`E2E_STATE`). Containers are named `e2e-*`.
 - The agent passes body attacks for a short time after it starts. `up.sh` waits until the agent has run for 120 seconds (`AGENT_MIN_AGE`) and until 16 body attacks in a row are blocked.
+- `up.sh` waits up to 300 seconds (`AGENT_FAILOPEN_WAIT`) for all handlers to leave CPU fail-open after readiness. Each suite rejects any ON transition since its agent-clock start time and checks the final state. Probe errors fail the check. `AGENT_PROBE_TIMEOUT` bounds standalone probes (default: 60 seconds); readiness probes use the remaining wait time.
 - `ASYNC=1` writes the agent setting `agent.asyncMode.nginxModule` and restarts the agent when the mode changes.
 - Run the load generator for performance tests on a different host from the system under test.

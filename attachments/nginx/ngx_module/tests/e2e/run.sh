@@ -6,7 +6,27 @@ IMG=${1:?usage: run.sh IMAGE [functional|uploads|kong|h2]...}; shift
 SUITES=${*:-functional uploads kong h2}
 W="$E2E_STATE/work"; mkdir -p "$W"
 up() { "$E2E_DIR/up.sh" "$IMG" "$@" || { FAILS=$((FAILS+1)); echo "FAIL  up $*"; return 1; }; }
-no_crash() { check "$1: no worker crash" 0 "$(nginx_log_count 'exited on signal')"; }
+no_crash() {
+  check "$1: no worker crash" 0 "$(nginx_log_count 'exited on signal')"
+  local start handlers
+  if start=$(cat "$E2E_STATE/suite_start") && handlers=$(agent_failopen since "$start"); then
+    # A suite with no attack checks (uploads) may cause fail-open; its results stay valid.
+    if [ "$2" = allow-failopen ]; then
+      [ -n "$handlers" ] && echo "INFO  $1: agent fail-open during suite (handlers $handlers); no attack checks in this suite"
+    else
+      check "$1: agent fail-open during suite" "" "$handlers"
+    fi
+  else
+    check "$1: agent fail-open during suite" "" "probe-error"
+  fi
+  # The next up.sh waits for fail-open to end, so an allowed suite skips the end check.
+  [ "$2" = allow-failopen ] && return
+  if handlers=$(agent_failopen state); then
+    check "$1: agent fail-open at suite end" "" "$handlers"
+  else
+    check "$1: agent fail-open at suite end" "" "probe-error"
+  fi
+}
 
 functional() {
   for bb in 1m 8k; do
@@ -45,7 +65,7 @@ PY
     check "upload ${mb}MB Content-Length intact" "$want" "$(curl -s -m 300 -H 'Content-Type: application/json' --data-binary @"$f" "$U/sink")"
     check "upload ${mb}MB chunked intact" "$want" "$(curl -s -m 300 -H 'Content-Type: application/json' -H 'Transfer-Encoding: chunked' --data-binary @"$f" "$U/sink")"
   done
-  no_crash uploads
+  no_crash uploads allow-failopen
 }
 
 kong() { # issues found in the Kong attachment, replayed on NGINX

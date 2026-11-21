@@ -46,4 +46,26 @@ for i in $(seq 240); do
 done
 [ "$ok" -ge 16 ] || { echo "nginx did not become ready (body attacks not blocked)"; exit 1; }
 for i in $(seq 30); do code "$U/big.txt" >/dev/null; done
+deadline=$((SECONDS + ${AGENT_FAILOPEN_WAIT:-300})); previous=""
+while true; do
+  left=$((deadline - SECONDS))
+  [ "$left" -gt 0 ] || { echo "timed out waiting for agent fail-open off"; exit 1; }
+  # Read the clock before the state probe: an ON line written during the probe stays inside the suite window.
+  if ! suite_start=$(agent_now) || [ -z "$suite_start" ]; then
+    echo "could not read agent clock"; exit 1
+  fi
+  if ! handlers=$(AGENT_PROBE_TIMEOUT="$left" agent_failopen state); then
+    echo "agent fail-open probe failed or timed out"; exit 1
+  fi
+  [ "$SECONDS" -lt "$deadline" ] || { echo "timed out waiting for agent fail-open off"; exit 1; }
+  [ -z "$handlers" ] && break
+  if [ "$handlers" != "$previous" ]; then
+    echo "waiting for agent fail-open off: handlers $handlers"
+    previous=$handlers
+  fi
+  left=$((deadline - SECONDS))
+  delay=5; [ "$left" -lt 5 ] && delay=$left
+  sleep "$delay"
+done
+printf "%s\n" "$suite_start" > "$E2E_STATE/suite_start"
 echo "up: image=$IMG bodybuf=$BB http2=$HTTP2 async=$ASYNC"
