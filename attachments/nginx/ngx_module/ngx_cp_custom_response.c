@@ -16,6 +16,7 @@
 #include "ngx_cp_custom_response.h"
 
 #include "ngx_cp_utils.h"
+#include "ngx_cp_hooks.h"
 
 ///
 /// @brief Pushes a key and value into a header list.
@@ -343,10 +344,35 @@ ngx_http_cp_finalize_rejected_request(ngx_http_request_t *request, int is_respon
     ngx_table_elt_t *location_header;
     ngx_chain_t out_chain[7]; // http://lxr.nginx.org/source/src/http/ngx_http_special_response.c#0772
     int send_response_custom_body = 1;
+    ngx_http_cp_session_data *session_data = recover_cp_session_data(request);
 
     write_dbg(DBG_LEVEL_DEBUG, "Finalizing rejecting request");
 
     request->keepalive = 0;
+
+    if (session_data != NULL && session_data->local_ipc_size_rejection) {
+        /* Never use worker-global agent response data for a local rejection. */
+        if (request->header_sent) {
+            rc = NGX_HTTP_CLOSE;
+            goto CUSTOM_RES_OUT;
+        }
+        delete_headers_list(&request->headers_out.headers);
+        request->headers_out.status = NGX_HTTP_FORBIDDEN;
+        request->headers_out.status_line.len = 0;
+        request->headers_out.location = NULL;
+        request->headers_out.content_length = NULL;
+        request->headers_out.content_length_n = 0;
+        request->headers_out.content_type.len = 0;
+        request->headers_out.content_type_len = 0;
+        request->headers_out.content_encoding = NULL;
+        request->headers_out.last_modified = NULL;
+        request->headers_out.last_modified_time = -1;
+        rc = ngx_http_send_header(request);
+        if (rc == NGX_OK && !request->header_only) {
+            rc = ngx_http_send_special(request, NGX_HTTP_LAST);
+        }
+        goto CUSTOM_RES_OUT;
+    }
 
     http_res_code = get_response_code();
     request->headers_out.status = http_res_code;

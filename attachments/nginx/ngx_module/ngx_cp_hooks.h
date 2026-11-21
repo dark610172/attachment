@@ -40,6 +40,7 @@ static const ngx_int_t METRIC_TIMEOUT_VAL = METRIC_PERIODIC_TIMEOUT;
 typedef struct ngx_http_cp_session_data {
     ngx_int_t              was_request_fully_inspected; ///< Holds if the request fully inspected.
     ServiceVerdict         verdict; ///< Holds the session's verdict from the Nano Service.
+    unsigned              local_ipc_size_rejection:1; ///< Reject without agent response state.
     uint32_t               session_id; ///< Current session's Id.
     ngx_int_t              remaining_messages_to_reply; ///< Remaining messages left for the agent to respond to.
     ngx_http_response_data response_data; ///< Holds session's response data.

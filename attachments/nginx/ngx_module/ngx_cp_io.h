@@ -27,6 +27,11 @@
 #include "ngx_cp_hooks.h"
 
 #define INSPECTION_IRRELEVANT NGX_DECLINED
+/* Keep in sync with core/shmem_ipc_2/shared_ring_queue.c. */
+#define NGX_CP_IPC_MAX_WRITE_SIZE 0xfffcU
+#define NGX_CP_HEADER_BULK_OVERHEAD (sizeof(uint16_t) + sizeof(uint32_t) + 2 * sizeof(uint8_t))
+
+size_t ngx_cp_header_wire_size(const ngx_table_elt_t *header);
 
 extern SharedMemoryIPC *nano_service_ipc; ///< Nano service's IPC.
 extern SharedMemoryIPC *nano_service_secondary_sync_ipc; ///< Secondary sync IPC.

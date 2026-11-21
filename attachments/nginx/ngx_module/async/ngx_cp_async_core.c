@@ -2055,6 +2055,14 @@ ngx_cp_async_continue_processing(ngx_http_cp_async_ctx_t *ctx)
                     return NGX_DECLINED;
                 }
 
+                if (rc == NGX_HTTP_FORBIDDEN) {
+                    ctx->session_data->verdict = TRAFFIC_VERDICT_DROP;
+                    ctx->session_data->async_processing_needed = 0;
+                    ngx_cp_async_cancel_timers(ctx);
+                    ASYNC_STAGE_TRANSITION(ctx, NGX_CP_ASYNC_STAGE_COMPLETE);
+                    return NGX_HTTP_FORBIDDEN;
+                }
+
                 if (rc != NGX_OK) {
                     write_dbg(DBG_LEVEL_DEBUG, "Failed to send meta-data for session %d - rc: %d", ctx->session_id, rc);
                     ctx->flow_error = 1;
@@ -2084,6 +2092,14 @@ ngx_cp_async_continue_processing(ngx_http_cp_async_ctx_t *ctx)
                     ctx->session_id
                 );
 
+                if (rc == NGX_HTTP_FORBIDDEN) {
+                    ctx->session_data->verdict = TRAFFIC_VERDICT_DROP;
+                    ctx->session_data->async_processing_needed = 0;
+                    ngx_cp_async_cancel_timers(ctx);
+                    ASYNC_STAGE_TRANSITION(ctx, NGX_CP_ASYNC_STAGE_COMPLETE);
+                    return NGX_HTTP_FORBIDDEN;
+                }
+
                 if (rc != NGX_OK) {
                     write_dbg(DBG_LEVEL_WARNING, "Failed to send headers for session %d - rc: %d", ctx->session_id, rc);
                     ctx->flow_error = 1;
@@ -2111,6 +2127,14 @@ ngx_cp_async_continue_processing(ngx_http_cp_async_ctx_t *ctx)
                     num_messages_sent,
                     ctx->session_id
                 );
+
+                if (rc == NGX_HTTP_FORBIDDEN) {
+                    ctx->session_data->verdict = TRAFFIC_VERDICT_DROP;
+                    ctx->session_data->async_processing_needed = 0;
+                    ngx_cp_async_cancel_timers(ctx);
+                    ASYNC_STAGE_TRANSITION(ctx, NGX_CP_ASYNC_STAGE_COMPLETE);
+                    return NGX_HTTP_FORBIDDEN;
+                }
 
                 if (rc != NGX_OK) {
                     write_dbg(DBG_LEVEL_WARNING, "End transaction sender failed for session %d", ctx->session_id);

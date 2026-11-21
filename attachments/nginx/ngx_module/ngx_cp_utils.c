@@ -58,7 +58,6 @@ static char web_response_body[256]; ///< Web response body static buffer.
 
 static ngx_uint_t web_response_uuid_size = 0;
 static char web_response_uuid[64]; ///< Web response body uuid buffer.
-static char incident[sizeof(web_response_uuid) + 16]; ///< Web response body uuid buffer with incident Id prefix.
 
 static ngx_uint_t add_event_id = 0;
 static ngx_uint_t redirect_location_size = 0; ///< Redirect location size.
@@ -629,14 +628,21 @@ get_block_page_response(ngx_http_request_t *request, ngx_chain_t (*out_chain)[7]
     ngx_chain_t *tmp_next;
     size_t incident_prefix_size = strlen("Incident Id: ");
     ngx_buf_t *buf[7]; // Title prefix -> Title -> Body prefix -> Body -> UUID prefix -> UUID -> UUID suffix
-    ngx_str_t title  = { web_response_title_size, (u_char *)web_response_title };
-    ngx_str_t body = { web_response_body_size, (u_char *)web_response_body };
-    ngx_str_t uuid = { web_response_uuid_size + incident_prefix_size, (u_char *)incident };
+    ngx_str_t title = { web_response_title_size, NULL };
+    ngx_str_t body = { web_response_body_size, NULL };
+    ngx_str_t uuid = { web_response_uuid_size + incident_prefix_size, NULL };
 
     if (web_response_title_size == 0 || web_response_body_size == 0) return NGX_ERROR_ERR;
 
-    memcpy(incident, "Incident Id: ", incident_prefix_size);
-    memcpy(incident + incident_prefix_size, web_response_uuid, web_response_uuid_size);
+    title.data = ngx_pnalloc(request->pool, title.len);
+    body.data = ngx_pnalloc(request->pool, body.len);
+    uuid.data = ngx_pnalloc(request->pool, uuid.len);
+    if (title.data == NULL || body.data == NULL || uuid.data == NULL) return NGX_ERROR_ERR;
+
+    ngx_memcpy(title.data, web_response_title, title.len);
+    ngx_memcpy(body.data, web_response_body, body.len);
+    ngx_memcpy(uuid.data, "Incident Id: ", incident_prefix_size);
+    ngx_memcpy(uuid.data + incident_prefix_size, web_response_uuid, web_response_uuid_size);
 
     for (idx = 0; idx < 7; idx++) {
         buf[idx] = ngx_calloc_buf(request->pool);

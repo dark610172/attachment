@@ -61,10 +61,12 @@ cp_async_body_failure(ngx_http_request_t *r, ngx_http_cp_session_data *sd,
                       ngx_http_cp_async_ctx_t *ctx, ngx_chain_t *in)
 {
     ngx_int_t rc = NGX_HTTP_FORBIDDEN;
-    sd->verdict = fail_mode_verdict == NGX_OK ? TRAFFIC_VERDICT_ACCEPT : TRAFFIC_VERDICT_DROP;
+    if (sd->verdict != TRAFFIC_VERDICT_DROP) {
+        sd->verdict = fail_mode_verdict == NGX_OK ? TRAFFIC_VERDICT_ACCEPT : TRAFFIC_VERDICT_DROP;
+    }
     sd->async_processing_needed = 0;
     sd->remaining_messages_to_reply = 0;
-    if (fail_mode_verdict == NGX_OK) {
+    if (sd->verdict == TRAFFIC_VERDICT_ACCEPT) {
         if (ctx && ctx->queue_head) {
             if (in && chain_add_copy(r, ctx, in) != NGX_OK) return NGX_ERROR;
             rc = ngx_http_next_request_body_filter(r, ctx->queue_head);

@@ -80,6 +80,26 @@ ngx_http_cp_signal_to_service_with_timeout(uint32_t cur_session_id, ngx_uint_t t
     return NGX_OK;
 }
 
+/* Queue pressure and oversized messages affect only the current request. */
+static ngx_int_t
+ngx_cp_async_send_error(ngx_http_cp_async_ctx_t *ctx, int error)
+{
+    if (error == -2 || error == -3) {
+        /* Wake the agent for any queued prefix before failing this request. */
+        (void)ngx_http_cp_signal_to_service_with_timeout(ctx->session_id, async_signal_timeout_ms);
+        ngx_cp_async_post_backpressure_drain_event();
+    }
+    if (error == -2) {
+        write_dbg(DBG_LEVEL_WARNING, "Rejecting session %u: IPC message exceeds write limit", ctx->session_id);
+        ctx->session_data->local_ipc_size_rejection = 1;
+        ctx->session_data->verdict = TRAFFIC_VERDICT_DROP;
+        return NGX_HTTP_FORBIDDEN;
+    }
+    if (error != -3) disconnect_communication();
+    return NGX_ERROR;
+}
+
+
 /// @brief Generic wait verdict handler for all wait stages
 /// @param[in] ctx Async context
 /// @param[in] stage_name Stage name for logging
@@ -109,8 +129,7 @@ ngx_cp_async_wait_signal_sender(ngx_http_cp_async_ctx_t *ctx, ngx_uint_t *num_me
     err_code = sendChunkedData(nano_service_ipc, fragments_sizes, (const char **)fragments, wait_fragments_count);
     if (err_code != 0) {
         write_dbg(DBG_LEVEL_WARNING, "Failed to send wait data to shared memory for session %d, error: %d", session_id, err_code);
-        disconnect_communication();
-        return NGX_ERROR;
+        return ngx_cp_async_send_error(ctx, err_code);
     }
     ngx_cp_async_increment_pending_chunks(session_id, "wait_signal");
 
@@ -148,6 +167,7 @@ ngx_cp_async_send_meta_data_nonblocking(ngx_http_cp_async_ctx_t *ctx, ngx_uint_t
     uint16_t client_port;
     uint16_t chunck_type;
     uint16_t listening_port;
+    uint16_t zero = 0;
     ngx_int_t res;
     ngx_str_t maybe_host = { 0, (u_char *)"" };
     ngx_str_t ngx_parsed_host = { 0, (u_char *)"" };
@@ -258,7 +278,6 @@ ngx_cp_async_send_meta_data_nonblocking(ngx_http_cp_async_ctx_t *ctx, ngx_uint_t
         set_fragment_elem(fragments, fragments_sizes, &ctx->waf_tag.len, sizeof(uint16_t), WAF_TAG_SIZE + 2);
         set_fragment_elem(fragments, fragments_sizes, ctx->waf_tag.data, ctx->waf_tag.len, WAF_TAG_DATA + 2);
     } else {
-        uint16_t zero = 0;
         set_fragment_elem(fragments, fragments_sizes, &zero, sizeof(uint16_t), WAF_TAG_SIZE + 2);
         set_fragment_elem(fragments, fragments_sizes, "", 0, WAF_TAG_DATA + 2);
     }
@@ -268,8 +287,7 @@ ngx_cp_async_send_meta_data_nonblocking(ngx_http_cp_async_ctx_t *ctx, ngx_uint_t
     err_code = sendChunkedData(nano_service_ipc, fragments_sizes, (const char **)fragments, META_DATA_COUNT + 2);
     if (err_code != 0) {
         write_dbg(DBG_LEVEL_WARNING, "Failed to send meta data chunk - error code %d", err_code);
-        disconnect_communication();
-        return NGX_ERROR;
+        return ngx_cp_async_send_error(ctx, err_code);
     }
     ngx_cp_async_increment_pending_chunks(ctx->session_id, "meta_data");
 
@@ -289,6 +307,22 @@ ngx_cp_async_send_meta_data_nonblocking(ngx_http_cp_async_ctx_t *ctx, ngx_uint_t
     return NGX_OK;
 }
 
+static ngx_int_t
+ngx_cp_async_send_header_bulk(ngx_http_cp_async_ctx_t *ctx, char **fragments, uint16_t *sizes,
+                              ngx_uint_t count, uint8_t last, uint8_t part)
+{
+    int error;
+    set_fragment_elem(fragments, sizes, &last, sizeof(last), 2);
+    set_fragment_elem(fragments, sizes, &part, sizeof(part), 3);
+    error = sendChunkedData(nano_service_ipc, sizes, (const char **)fragments, HEADER_DATA_COUNT * count + 4);
+    if (error != 0) {
+        write_dbg(DBG_LEVEL_WARNING, "Failed to send header bulk - error code %d", error);
+        return ngx_cp_async_send_error(ctx, error);
+    }
+    ngx_cp_async_increment_pending_chunks(ctx->session_id, "headers");
+    return NGX_OK;
+}
+
 ///
 /// @brief Async version of ngx_http_cp_header_sender - sends data but doesn't wait
 /// @param[in] ctx Async context
@@ -298,6 +332,8 @@ ngx_cp_async_send_meta_data_nonblocking(ngx_http_cp_async_ctx_t *ctx, ngx_uint_t
 ngx_int_t
 ngx_cp_async_send_headers_nonblocking(ngx_http_cp_async_ctx_t *ctx, ngx_uint_t *num_messages_sent)
 {
+    size_t bulk_bytes = NGX_CP_HEADER_BULK_OVERHEAD;
+    size_t header_bytes;
     ngx_uint_t header_idx = 0;
     ngx_uint_t idx_in_bulk = 0;
     ngx_uint_t num_of_bulks_sent = 0;
@@ -310,7 +346,6 @@ ngx_cp_async_send_headers_nonblocking(ngx_http_cp_async_ctx_t *ctx, ngx_uint_t *
     const ngx_uint_t max_bulk_size = 10;
     char *fragments[HEADER_DATA_COUNT * max_bulk_size + 4];
     uint16_t fragments_sizes[HEADER_DATA_COUNT * max_bulk_size + 4];
-    int err_code = 0;
     ngx_int_t res;
 
     write_dbg(DBG_LEVEL_TRACE, "Sending request headers for session %d", ctx->session_id);
@@ -333,30 +368,28 @@ ngx_cp_async_send_headers_nonblocking(ngx_http_cp_async_ctx_t *ctx, ngx_uint_t *
             );
 
             is_last_part = (headers_iter->next == NULL && header_idx + 1 == headers_iter->nelts) ? 1 : 0;
+            header_bytes = ngx_cp_header_wire_size(header);
+            if (header_bytes > NGX_CP_IPC_MAX_WRITE_SIZE - NGX_CP_HEADER_BULK_OVERHEAD) {
+                return ngx_cp_async_send_error(ctx, -2);
+            }
+            if (idx_in_bulk != 0 && header_bytes > NGX_CP_IPC_MAX_WRITE_SIZE - bulk_bytes) {
+                res = ngx_cp_async_send_header_bulk(ctx, fragments, fragments_sizes, idx_in_bulk, 0, bulk_part_idx);
+                if (res != NGX_OK) return res;
+                num_of_bulks_sent++;
+                idx_in_bulk = 0;
+                bulk_part_idx = part_count;
+                bulk_bytes = NGX_CP_HEADER_BULK_OVERHEAD;
+            }
             add_header_to_bulk(fragments, fragments_sizes, header, idx_in_bulk);
+            bulk_bytes += header_bytes;
 
             idx_in_bulk++;
             part_count++;
             if (idx_in_bulk < max_bulk_size && !is_last_part) continue;
 
-            set_fragment_elem(fragments, fragments_sizes, &is_last_part, sizeof(is_last_part), 2);
-            set_fragment_elem(fragments, fragments_sizes, &bulk_part_idx, sizeof(bulk_part_idx), 3);
-
-            write_dbg(DBG_LEVEL_TRACE, "Sending header bulk to shared memory");
-            err_code = sendChunkedData(
-                nano_service_ipc,
-                fragments_sizes,
-                (const char **)fragments,
-                HEADER_DATA_COUNT * idx_in_bulk + 4
-            );
-
-            if (err_code != 0) {
-                write_dbg(DBG_LEVEL_WARNING, "Failed to send header bulk - error code %d", err_code);
-                disconnect_communication();
-                return NGX_ERROR;
-            }
-
-            ngx_cp_async_increment_pending_chunks(ctx->session_id, "headers");
+            res = ngx_cp_async_send_header_bulk(ctx, fragments, fragments_sizes, idx_in_bulk,
+                                                 is_last_part, bulk_part_idx);
+            if (res != NGX_OK) return res;
 
             num_of_bulks_sent++;
 
@@ -364,6 +397,7 @@ ngx_cp_async_send_headers_nonblocking(ngx_http_cp_async_ctx_t *ctx, ngx_uint_t *
 
             idx_in_bulk = 0;
             bulk_part_idx = part_count;
+            bulk_bytes = NGX_CP_HEADER_BULK_OVERHEAD;
         }
     }
 
@@ -376,26 +410,8 @@ ngx_cp_async_send_headers_nonblocking(ngx_http_cp_async_ctx_t *ctx, ngx_uint_t *
             .value = { .len = 0, .data = (u_char *)"" }
         };
         add_header_to_bulk(fragments, fragments_sizes, &empty_header, 0);
-        uint8_t is_last_part = 1;
-        uint8_t bulk_part_idx = 0;
-        set_fragment_elem(fragments, fragments_sizes, &is_last_part, sizeof(is_last_part), 2);
-        set_fragment_elem(fragments, fragments_sizes, &bulk_part_idx, sizeof(bulk_part_idx), 3);
-
-        err_code = sendChunkedData(
-            nano_service_ipc,
-            fragments_sizes,
-            (const char **)fragments,
-            HEADER_DATA_COUNT * 1 + 4
-        );
-
-        if (err_code != 0) {
-            write_dbg(DBG_LEVEL_WARNING, "Failed to send empty header list - error code %d", err_code);
-            disconnect_communication();
-            return NGX_ERROR;
-        }
-
-        // Increment pending chunks counter for empty headers
-        ngx_cp_async_increment_pending_chunks(ctx->session_id, "headers");
+        res = ngx_cp_async_send_header_bulk(ctx, fragments, fragments_sizes, 1, 1, 0);
+        if (res != NGX_OK) return res;
 
         num_of_bulks_sent = 1;
     }
@@ -438,8 +454,7 @@ ngx_cp_async_send_end_transaction_nonblocking(ngx_http_cp_async_ctx_t *ctx, ngx_
     err_code = sendChunkedData(nano_service_ipc, fragments_sizes, (const char **)fragments, 2);
     if (err_code != 0) {
         write_dbg(DBG_LEVEL_WARNING, "Failed to send end transaction - error code %d", err_code);
-        disconnect_communication();
-        return NGX_ERROR;
+        return ngx_cp_async_send_error(ctx, err_code);
     }
 
     ngx_cp_async_increment_pending_chunks(ctx->session_id, "end_transaction");
@@ -516,8 +531,7 @@ ngx_cp_async_send_single_body_chunk_nonblocking(ngx_http_cp_async_ctx_t *ctx, ng
             res = sendChunkedData(nano_service_ipc, fragments_sizes, (const char **)fragments, num_body_chunk_fragments);
             if (res != 0) {
                 write_dbg(DBG_LEVEL_WARNING, "Failed to send single body chunk to agent for session %d: %d", ctx->session_id, res);
-                disconnect_communication();
-                return NGX_ERROR;
+                return ngx_cp_async_send_error(ctx, res);
             }
             ngx_cp_async_increment_pending_chunks(ctx->session_id, "body_chunk");
             (*num_messages_sent)++;
@@ -556,7 +570,7 @@ ngx_cp_async_send_to_agent_nonblocking(
 {
     ngx_int_t res;
     NanoHttpRequestData *request_data;
-    uint16_t total_size;
+    size_t total_size;
     const char *chunks[2];
     uint16_t chunk_sizes[2];
 
@@ -568,6 +582,7 @@ ngx_cp_async_send_to_agent_nonblocking(
     );
 
     total_size = sizeof(NanoHttpRequestData) + data_size;
+    if (total_size > NGX_CP_IPC_MAX_WRITE_SIZE) return ngx_cp_async_send_error(ctx, -2);
 
     request_data = ngx_palloc(ctx->request->pool, total_size);
     if (request_data == NULL) {
@@ -583,13 +598,12 @@ ngx_cp_async_send_to_agent_nonblocking(
     }
 
     chunks[0] = (const char *)request_data;
-    chunk_sizes[0] = total_size;
+    chunk_sizes[0] = (uint16_t)total_size;
 
     res = sendChunkedData(nano_service_ipc, chunk_sizes, chunks, 1);
     if (res != 0) {
         write_dbg(DBG_LEVEL_WARNING, "Failed to send data to agent for session %d: %d", ctx->session_id, res);
-        disconnect_communication();
-        return NGX_ERROR;
+        return ngx_cp_async_send_error(ctx, res);
     }
 
     return NGX_OK;

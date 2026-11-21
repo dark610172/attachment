@@ -253,6 +253,17 @@ ngx_http_cp_send_data_to_service(
     ngx_int_t max_retries;
     ngx_int_t res = NGX_OK;
     int err_code = 0;
+    size_t message_size = 0;
+    ngx_uint_t fragment_idx;
+
+    for (fragment_idx = 0; fragment_idx < num_of_data_elem; fragment_idx++) {
+        message_size += fragments_sizes[fragment_idx];
+    }
+    if (message_size > NGX_CP_IPC_MAX_WRITE_SIZE) {
+        write_dbg(DBG_LEVEL_WARNING, "Rejecting session %u: IPC message size %zu exceeds write limit",
+                  cur_session_id, message_size);
+        return NGX_HTTP_FORBIDDEN;
+    }
     write_dbg(DBG_LEVEL_DEBUG, "Sending session data chunk for inspection using %s IPC", 
               filter_mode == ASYNC_FILTER ? "secondary" : "primary");
 
@@ -260,6 +271,10 @@ ngx_http_cp_send_data_to_service(
         err_code = sendChunkedData(ipc, fragments_sizes, (const char **)fragments, num_of_data_elem);
         if (err_code == 0) {
             return NGX_OK;
+        }
+        if (err_code == -2) {
+            write_dbg(DBG_LEVEL_WARNING, "Rejecting session %u: IPC message exceeds write limit", cur_session_id);
+            return NGX_HTTP_FORBIDDEN;
         }
 
         write_dbg(DBG_LEVEL_DEBUG, "Failed to send data for inspection - %d attempts remained", max_retries - 1);
@@ -1138,6 +1153,17 @@ ngx_http_cp_content_length_sender(uint64_t content_length_n, uint32_t cur_req_id
     return NGX_OK;
 }
 
+size_t
+ngx_cp_header_wire_size(const ngx_table_elt_t *header)
+{
+    /* Check before adding or narrowing the NGINX lengths to uint16_t. */
+    if (header->key.len > NGX_CP_IPC_MAX_WRITE_SIZE || header->value.len > NGX_CP_IPC_MAX_WRITE_SIZE) {
+        return NGX_CP_IPC_MAX_WRITE_SIZE + 1;
+    }
+    return 2 * sizeof(uint16_t) + header->key.len + header->value.len;
+}
+
+
 ///
 /// @brief Create a header bulk.
 /// @param[in, out] fragments Fragment data array.
@@ -1187,7 +1213,7 @@ send_header_bulk(
     res = ngx_http_cp_send_data_to_service(data, data_sizes, HEADER_DATA_COUNT * num_headers + 4, cur_request_id, NULL, fail_open_timeout, min_retries_for_verdict, filter_mode);
     if (res != NGX_OK) {
         write_dbg(DBG_LEVEL_DEBUG, "Failed to send bulk of %iu headers", num_headers);
-        return NGX_ERROR;
+        return res;
     }
 
     (*num_of_bulks_sent)++;
@@ -1239,6 +1265,8 @@ ngx_http_cp_header_sender(
     ngx_str_t *content_type
 )
 {
+    size_t bulk_bytes = NGX_CP_HEADER_BULK_OVERHEAD;
+    size_t header_bytes;
     ngx_uint_t header_idx = 0;
     ngx_uint_t idx_in_bulk = 0;
     ngx_uint_t num_of_bulks_sent = 0;
@@ -1280,8 +1308,21 @@ ngx_http_cp_header_sender(
 
             is_last_part = (headers_iter->next == NULL && header_idx + 1 == headers_iter->nelts &&
                             (content_type == NULL || content_type->len == 0)) ? 1 : 0;
-            // Create a header bulk to send.
-                add_header_to_bulk(fragments, fragments_sizes, header, idx_in_bulk);
+            header_bytes = ngx_cp_header_wire_size(header);
+            if (header_bytes > NGX_CP_IPC_MAX_WRITE_SIZE - NGX_CP_HEADER_BULK_OVERHEAD) {
+                write_dbg(DBG_LEVEL_WARNING, "Rejecting session %u: single header exceeds IPC write limit", cur_request_id);
+                return NGX_HTTP_FORBIDDEN;
+            }
+            if (idx_in_bulk != 0 && header_bytes > NGX_CP_IPC_MAX_WRITE_SIZE - bulk_bytes) {
+                send_bulk_result = send_header_bulk(fragments, fragments_sizes, idx_in_bulk, 0, bulk_part_idx,
+                                                    &num_of_bulks_sent, cur_request_id, filter_mode);
+                if (send_bulk_result != NGX_OK) return send_bulk_result;
+                idx_in_bulk = 0;
+                bulk_part_idx = part_count;
+                bulk_bytes = NGX_CP_HEADER_BULK_OVERHEAD;
+            }
+            add_header_to_bulk(fragments, fragments_sizes, header, idx_in_bulk);
+            bulk_bytes += header_bytes;
 
             idx_in_bulk++;
             part_count++;
@@ -1298,12 +1339,13 @@ ngx_http_cp_header_sender(
                 cur_request_id,
                 filter_mode
             );
-            if (send_bulk_result != NGX_OK) return NGX_ERROR;
+            if (send_bulk_result != NGX_OK) return send_bulk_result;
 
             if (is_last_part) break;
 
             idx_in_bulk = 0;
             bulk_part_idx = part_count;
+            bulk_bytes = NGX_CP_HEADER_BULK_OVERHEAD;
         }
     }
 
@@ -1312,11 +1354,22 @@ ngx_http_cp_header_sender(
         ngx_memzero(&content_type_header, sizeof(content_type_header));
         ngx_str_set(&content_type_header.key, "Content-Type");
         content_type_header.value = *content_type;
-        add_header_to_bulk(fragments, fragments_sizes, &content_type_header, idx_in_bulk);
-        if (send_header_bulk(fragments, fragments_sizes, idx_in_bulk + 1, 1, bulk_part_idx,
-                             &num_of_bulks_sent, cur_request_id, filter_mode) != NGX_OK) {
-            return NGX_ERROR;
+        header_bytes = ngx_cp_header_wire_size(&content_type_header);
+        if (header_bytes > NGX_CP_IPC_MAX_WRITE_SIZE - NGX_CP_HEADER_BULK_OVERHEAD) {
+            write_dbg(DBG_LEVEL_WARNING, "Rejecting session %u: Content-Type exceeds IPC write limit", cur_request_id);
+            return NGX_HTTP_FORBIDDEN;
         }
+        if (idx_in_bulk != 0 && header_bytes > NGX_CP_IPC_MAX_WRITE_SIZE - bulk_bytes) {
+            send_bulk_result = send_header_bulk(fragments, fragments_sizes, idx_in_bulk, 0, bulk_part_idx,
+                                                &num_of_bulks_sent, cur_request_id, filter_mode);
+            if (send_bulk_result != NGX_OK) return send_bulk_result;
+            idx_in_bulk = 0;
+            bulk_part_idx = part_count;
+        }
+        add_header_to_bulk(fragments, fragments_sizes, &content_type_header, idx_in_bulk);
+        send_bulk_result = send_header_bulk(fragments, fragments_sizes, idx_in_bulk + 1, 1, bulk_part_idx,
+                                            &num_of_bulks_sent, cur_request_id, filter_mode);
+        if (send_bulk_result != NGX_OK) return send_bulk_result;
     } else if (part_count == 0 && header_type == RESPONSE_HEADER) {
         // Handling an empty response header.
         write_dbg(DBG_LEVEL_DEBUG, "Empty list of headers received. Sending last header message to nano service");

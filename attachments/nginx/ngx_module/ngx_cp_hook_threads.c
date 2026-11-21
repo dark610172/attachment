@@ -209,6 +209,11 @@ ngx_http_cp_req_header_handler_thread(void *_ctx)
             "Failed to send request meta data to the nano service. Session ID: %d",
             session_data_p->session_id
         );
+        if (send_meta_data_result == NGX_HTTP_FORBIDDEN) {
+            session_data_p->local_ipc_size_rejection = 1;
+            session_data_p->verdict = TRAFFIC_VERDICT_DROP;
+            THREAD_CTX_RETURN(NGX_HTTP_FORBIDDEN);
+        }
         handle_inspection_failure(inspection_failure_weight, fail_mode_verdict, session_data_p);
         THREAD_CTX_RETURN(fail_mode_verdict);
     }
@@ -239,6 +244,11 @@ ngx_http_cp_req_header_handler_thread(void *_ctx)
             "Failed to send request headers to the nano service. Session ID: %d",
             session_data_p->session_id
         );
+        if (send_header_result == NGX_HTTP_FORBIDDEN) {
+            session_data_p->local_ipc_size_rejection = 1;
+            session_data_p->verdict = TRAFFIC_VERDICT_DROP;
+            THREAD_CTX_RETURN(NGX_HTTP_FORBIDDEN);
+        }
         handle_inspection_failure(inspection_failure_weight, fail_mode_verdict, session_data_p);
         THREAD_CTX_RETURN(fail_mode_verdict);
     }
@@ -474,6 +484,11 @@ ngx_http_cp_res_header_filter_thread(void *_ctx)
                 "Failed to send response headers to the nano service. Session ID: %d",
                 session_data_p->session_id
             );
+            if (send_header_result == NGX_HTTP_FORBIDDEN) {
+                session_data_p->local_ipc_size_rejection = 1;
+                session_data_p->verdict = TRAFFIC_VERDICT_DROP;
+                THREAD_CTX_RETURN(NGX_HTTP_FORBIDDEN);
+            }
             handle_inspection_failure(inspection_failure_weight, fail_mode_verdict, session_data_p);
             if (fail_mode_verdict == NGX_OK) {
                 THREAD_CTX_RETURN_NEXT_FILTER();
