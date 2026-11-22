@@ -819,6 +819,12 @@ ngx_cp_async_handle_wait_verdict(ngx_http_cp_async_ctx_t *ctx, const char *stage
         return NGX_AGAIN;
     }
 
+    if (ctx->stage == NGX_CP_ASYNC_STAGE_WAIT_BODY_VERDICT ||
+        ctx->stage == NGX_CP_ASYNC_STAGE_WAIT_END_VERDICT) {
+        /* A signal timeout still leaves the wait message queued in shared memory. */
+        session_data->remaining_messages_to_reply += rc == NGX_HTTP_REQUEST_TIME_OUT ? 1 : num_messages_sent;
+        ngx_cp_async_start_deadline_timer(ctx, async_body_stage_timeout);
+    }
     ngx_add_timer(&ctx->agent_event, async_wait_verdict_timeout_ms);
 
     write_dbg(
@@ -1110,6 +1116,31 @@ ngx_cp_async_start_deadline_timer(ngx_http_cp_async_ctx_t *ctx, ngx_msec_t timeo
         ctx->deadline_event.cancelable = 1;
     }
 
+    if (ctx->stage == NGX_CP_ASYNC_STAGE_BODY ||
+        ctx->stage == NGX_CP_ASYNC_STAGE_WAIT_BODY_VERDICT ||
+        ctx->stage == NGX_CP_ASYNC_STAGE_END_TRANSACTION ||
+        ctx->stage == NGX_CP_ASYNC_STAGE_WAIT_END_VERDICT) {
+        ngx_msec_t limit = ngx_max(req_max_proccessing_ms_time, async_body_stage_timeout);
+        ngx_msec_t remaining = ctx->body_wait_msec < limit ? limit - ctx->body_wait_msec : 0;
+        ngx_msec_t elapsed = ctx->body_wait_active ? ngx_current_msec - ctx->body_wait_start : 0;
+
+        /* Saturate before adding, including across the millisecond clock wrap. */
+        elapsed = ngx_min(elapsed, remaining);
+        if (ctx->session_data->remaining_messages_to_reply == 0 ||
+            is_verdict_final(ctx->session_data->verdict)) {
+            ctx->body_wait_msec += elapsed;
+            ctx->body_wait_active = 0;
+            return NGX_OK; /* Client upload time does not consume the budget. */
+        }
+        if (!ctx->body_wait_active) {
+            ctx->body_wait_start = ngx_current_msec;
+            ctx->body_wait_active = 1;
+        }
+        timeout_ms = remaining - elapsed;
+    }
+
+    /* A zero timer runs the existing fail-mode handler on the next event-loop
+     * turn. It must not finalize/destroy ctx inside a body filter or IPC callback. */
     ngx_add_timer(&ctx->deadline_event, timeout_ms);
 
     write_dbg(
@@ -1997,6 +2028,13 @@ ngx_cp_async_apply_verdict(ngx_http_cp_async_ctx_t *ctx, HttpReplyFromService *r
         );
     }
 
+    if (ctx->stage == NGX_CP_ASYNC_STAGE_BODY ||
+        ctx->stage == NGX_CP_ASYNC_STAGE_WAIT_BODY_VERDICT ||
+        ctx->stage == NGX_CP_ASYNC_STAGE_END_TRANSACTION ||
+        ctx->stage == NGX_CP_ASYNC_STAGE_WAIT_END_VERDICT) {
+        ngx_cp_async_start_deadline_timer(ctx, async_body_stage_timeout);
+    }
+
     if (ctx->req_seq > 0) {
         ctx->req_seq--;
     }
@@ -2146,6 +2184,7 @@ ngx_cp_async_continue_processing(ngx_http_cp_async_ctx_t *ctx)
                 write_dbg(DBG_LEVEL_DEBUG, "End transaction sent - awaiting verdict for session %d", ctx->session_id);
                 ctx->session_data->remaining_messages_to_reply += num_messages_sent;
                 ctx->end_transaction_sent = 1;
+                ngx_cp_async_start_deadline_timer(ctx, async_body_stage_timeout);
                 return NGX_AGAIN;
             }
             break;
@@ -2174,7 +2213,8 @@ ngx_cp_async_continue_processing(ngx_http_cp_async_ctx_t *ctx)
                 ctx->session_data->was_request_fully_inspected = 1;
             }
 
-            ngx_cp_async_cancel_deadline_timer(ctx);
+            /* Stop timing when replies are drained; preserve any outstanding wait. */
+            ngx_cp_async_start_deadline_timer(ctx, async_body_stage_timeout);
             cp_async_post_request(ctx);
             return NGX_AGAIN;
             break;

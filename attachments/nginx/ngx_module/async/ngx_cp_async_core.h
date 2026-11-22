@@ -31,6 +31,9 @@ typedef struct ngx_http_cp_async_ctx {
     ngx_event_t                        cleanup_event;    ///< Context cleanup timeout event
     ngx_event_t                        resume_event;     ///< Event to resume request processing
     struct timespec                    start_time;       ///< Processing start time
+    ngx_msec_t                         body_wait_msec;   ///< Accumulated agent wait time
+    ngx_msec_t                         body_wait_start;  ///< Start of active agent wait interval
+    unsigned                           body_wait_active:1; ///< Agent replies are outstanding
     ngx_str_t                          waf_tag;          ///< WAF tag for this request
     ngx_http_cp_modification_list     *modifications;   ///< Modifications data
     unsigned                           waiting:1;            ///< Flag to indicate waiting for verdict

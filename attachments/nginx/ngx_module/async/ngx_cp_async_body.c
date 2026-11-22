@@ -148,6 +148,7 @@ ngx_http_cp_req_body_filter_async(ngx_http_request_t *r, ngx_chain_t *in)
             }
             ctx->req_seq += nmsgs;
             sd->remaining_messages_to_reply += nmsgs;
+            ngx_cp_async_start_deadline_timer(ctx, async_body_stage_timeout);
             if (b->last_buf && !ctx->end_transaction_sent) {
                 if (ngx_cp_async_send_end_transaction_nonblocking(ctx, &nmsgs) != NGX_OK) {
                     return cp_async_body_failure(r, sd, ctx, NULL);
@@ -155,10 +156,10 @@ ngx_http_cp_req_body_filter_async(ngx_http_request_t *r, ngx_chain_t *in)
                 ctx->req_seen_last = 1;
                 ctx->req_seq += nmsgs;
                 sd->remaining_messages_to_reply += nmsgs;
+                ngx_cp_async_start_deadline_timer(ctx, async_body_stage_timeout);
             }
         }
         ctx->waiting = 1;
-        ngx_cp_async_start_deadline_timer(ctx, ngx_max(req_max_proccessing_ms_time, async_body_stage_timeout));
         if (ctx->req_seq == 0 && sd->verdict != TRAFFIC_VERDICT_DELAYED) {
             ngx_cp_async_event_handler(&ctx->agent_event);
         }

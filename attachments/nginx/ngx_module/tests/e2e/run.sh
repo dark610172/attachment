@@ -1,9 +1,9 @@
 #!/bin/bash
 # run.sh IMAGE [SUITE...] — end-to-end checks against a live agent. Exit code 0 only if every check passes.
-# Suites: functional uploads kong h2 (default: all). ASYNC=1 runs them in async mode (async builds only).
+# Suites: functional uploads kong h2 slowagent (default: all). ASYNC=1 runs them in async mode (async builds only).
 . "$(dirname "$0")/lib.sh"
-IMG=${1:?usage: run.sh IMAGE [functional|uploads|kong|h2]...}; shift
-SUITES=${*:-functional uploads kong h2}
+IMG=${1:?usage: run.sh IMAGE [functional|uploads|kong|h2|slowagent]...}; shift
+SUITES=${*:-functional uploads kong h2 slowagent}
 W="$E2E_STATE/work"; mkdir -p "$W"
 up() { "$E2E_DIR/up.sh" "$IMG" "$@" || { FAILS=$((FAILS+1)); echo "FAIL  up $*"; return 1; }; }
 no_crash() {
@@ -93,6 +93,58 @@ h2() {
   check "h2 300KB clean x10" 200 "$(repeat 10 post_json @"$W/b.300000.none" $H "$U/upload")"
   check "h2 no double finalize (request count is zero)" 0 "$(nginx_log_count 'count is zero')"
   no_crash h2
+}
+
+slowagent() {
+  if [ "${ASYNC:-0}" != 1 ]; then echo "SKIP slowagent (sync)"; return; fi
+  HTTP2=0 up 8k || return
+  local f="$W/b.366000.none" result status elapsed i bounded=1 times=""
+  mkjson 366000 none "$f"
+  check "slow client: POST 366KB at 40k/s" 200 "$(code --limit-rate 40k \
+    -H 'Content-Type: application/json' --data-binary @"$f" "$U/upload")"
+  docker exec e2e-agent sh -c 'rm -f /tmp/e2e-slowagent.stop /tmp/e2e-slowagent.done' || {
+    check "slow agent: loop setup" 0 1; return
+  }
+  docker exec -d e2e-agent sh -c '
+    pids=$(ps -eo pid,args | awk '\''$2 == "/etc/cp/HttpTransactionHandler/cp-nano-http-transaction-handler" {print $1}'\'')
+    trap '\''rc=$?; kill -CONT $pids 2>/dev/null; echo "$rc" > /tmp/e2e-slowagent.done'\'' EXIT
+    trap '\''exit 1'\'' INT TERM
+    [ -n "$pids" ] || exit 1
+    end=$(($(date +%s) + 40))
+    while [ "$(date +%s)" -lt "$end" ] && [ ! -e /tmp/e2e-slowagent.stop ]; do
+      kill -STOP $pids || exit 1
+      sleep 0.5
+      kill -CONT $pids || exit 1
+      sleep 0.005
+    done
+  ' || { check "slow agent: loop launch" 0 1; return; }
+  slowagent_cleanup() {
+    docker exec e2e-agent sh -c '
+      [ "$1" != stop ] || touch /tmp/e2e-slowagent.stop
+      # The loop must end before the final CONT, so it cannot send another STOP.
+      while [ ! -f /tmp/e2e-slowagent.done ]; do sleep 0.1; done
+      pids=$(ps -eo pid,args | awk '\''$2 == "/etc/cp/HttpTransactionHandler/cp-nano-http-transaction-handler" {print $1}'\'')
+      kill -CONT $pids || exit 1
+      [ "$(cat /tmp/e2e-slowagent.done)" = 0 ]
+    ' sh "$1"
+  }
+  trap 'slowagent_cleanup stop' EXIT
+  trap 'exit 130' INT
+  trap 'exit 143' TERM
+  for i in 1 2 3; do
+    result=$(curl -s -m 30 -o /dev/null -w '%{http_code} %{time_total}' \
+      -H 'Content-Type: application/json' --data-binary @"$f" "$U/upload") || bounded=0
+    read -r status elapsed <<< "$result"
+    times="$times $result;"
+    if [ "$status" != 200 ] || ! awk -v t="$elapsed" 'BEGIN {exit !(t ~ /^[0-9]+([.][0-9]+)?$/ && t < 7)}'; then
+      bounded=0
+    fi
+  done
+  slowagent_cleanup wait || bounded=0
+  trap - EXIT INT TERM
+  [ "$bounded" = 1 ] || echo "INFO  slow agent status/time_total:$times"
+  check "slow agent: POST 366KB bounded" 1 "$bounded"
+  no_crash slowagent allow-failopen
 }
 
 for s in $SUITES; do echo "== $s (image=$IMG async=${ASYNC:-0})"; "$s"; done

@@ -22,6 +22,7 @@ ASYNC=1 ./run.sh <async-nginx-image>    # async mode (module built with NGINX_AS
 | uploads | 1, 50 and 300 MB uploads with Content-Length and chunked encoding. The backend must receive the same size and SHA-256. |
 | kong | Issues first found in the Kong attachment: chunked bodies, many headers, and malformed requests. |
 | h2 | HTTP/2 (h2c) body attacks and clean bodies. NGINX must not log "http request count is zero". |
+| slowagent | Async only. The agent handlers stop for 0.5 s and run for 5 ms, in a loop. A clean 366 KB body must return 200 in less than 7 s. A slow client (40 KB/s) must also get 200, because client time does not count. |
 
 Every suite also fails if an NGINX worker exits on a signal.
 
