@@ -15,7 +15,7 @@
 | open-appsec 文件 | [docs.openappsec.io](https://docs.openappsec.io/) |
 | 授權 | Apache License 2.0，與上游相同，見 [LICENSE](LICENSE) |
 
-本 fork 的 `main` 分支和上游 `main` 相同。修正都放在下面兩個分支。
+本 fork 的 `main` 分支已依序合併下面兩個修正分支：先合併 Kong 外掛分支，再合併 NGINX 模組分支。
 
 ## 分支
 
