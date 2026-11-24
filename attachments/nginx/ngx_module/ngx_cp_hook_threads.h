@@ -43,6 +43,7 @@ struct ngx_http_cp_event_thread_ctx_t
     /// Should context continue to the next filter.
     int should_return_next_filter;
     int chain_part_number;
+    int terminal_body_verdict; ///< A terminal reply was received during this body stage.
 
     ngx_http_cp_modification_list *modifications; ///< Context's modification.
     ngx_str_t waf_tag; ///< WAF tag value for the location block.

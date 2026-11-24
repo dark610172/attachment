@@ -98,4 +98,17 @@ compress_body(
     ngx_pool_t *pool
 );
 
+/* Output uses tagged buffers from free_buffers and does not change input descriptors. */
+ngx_int_t
+compress_body_reuse(
+    CompressionStream *compression_stream,
+    const CompressionType compression_type,
+    const int is_last_part,
+    ngx_chain_t *input,
+    ngx_chain_t **output,
+    ngx_chain_t **free_buffers,
+    ngx_buf_tag_t tag,
+    ngx_pool_t *pool
+);
+
 #endif // __NGX_CP_COMPRESSION_H__

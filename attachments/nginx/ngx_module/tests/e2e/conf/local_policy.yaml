@@ -1,0 +1,73 @@
+apiVersion: v1beta2
+# Minimal prevent policy for the end-to-end tests. Only the web-attack engine is needed.
+policies:
+  default:
+    mode: prevent-learn
+    threatPreventionPractices:
+      - webapp-default-practice
+    accessControlPractices:
+      - ac-default
+    triggers:
+      - appsec-default-log-trigger
+    customResponse: appsec-default-web-user-response
+  specificRules: []
+threatPreventionPractices:
+  - name: webapp-default-practice
+    practiceMode: inherited
+    webAttacks:
+      overrideMode: inherited
+      minimumConfidence: high
+      maxBodySizeKb: 1000000
+      maxHeaderSizeBytes: 102400
+      maxObjectDepth: 40
+      maxUrlSizeBytes: 32768
+      protections:
+        csrfProtection: inactive
+        errorDisclosure: inactive
+        nonValidHttpMethods: false
+        openRedirect: inactive
+    snortSignatures:
+      overrideMode: inactive
+      files: []
+    schemaValidation:
+      overrideMode: inactive
+    intrusionPrevention:
+      overrideMode: inactive
+    fileSecurity:
+      overrideMode: inactive
+    antiBot:
+      overrideMode: detect
+      injectedUris: []
+      validatedUris: []
+accessControlPractices:
+  - name: ac-default
+    practiceMode: inherited
+    rateLimit:
+      overrideMode: inactive
+      rules: []
+logTriggers:
+  - name: appsec-default-log-trigger
+    accessControlLogging:
+      allowEvents: false
+      dropEvents: true
+    appsecLogging:
+      allWebRequests: false
+      detectEvents: true
+      preventEvents: true
+    extendedLogging:
+      httpHeaders: false
+      requestBody: false
+      urlPath: false
+      urlQuery: false
+    additionalSuspiciousEventsLogging:
+      enabled: false
+      minSeverity: high
+      responseBody: false
+    logDestination:
+      cloud: false
+      stdout:
+        format: json
+customResponses:
+  - name: appsec-default-web-user-response
+    mode: response-code-only
+    httpResponseCode: 403

@@ -58,7 +58,6 @@ static char web_response_body[256]; ///< Web response body static buffer.
 
 static ngx_uint_t web_response_uuid_size = 0;
 static char web_response_uuid[64]; ///< Web response body uuid buffer.
-static char incident[sizeof(web_response_uuid) + 16]; ///< Web response body uuid buffer with incident Id prefix.
 
 static ngx_uint_t add_event_id = 0;
 static ngx_uint_t redirect_location_size = 0; ///< Redirect location size.
@@ -126,6 +125,7 @@ ngx_uint_t is_brotli_inspection_enabled = 0; ///< Brotli inspection enabled flag
 
 // Custom response support with dynamic headers
 static CustomResponseHeader *custom_response_headers = NULL;
+static ngx_pool_t *custom_response_pool = NULL;
 static ngx_str_t custom_response_body = {0, NULL};
 static ngx_uint_t custom_response_code = NGX_HTTP_FORBIDDEN;
 
@@ -164,21 +164,24 @@ init_list_iterator(ngx_list_t *list, ngx_http_cp_list_iterator *iterator)
 void *
 get_list_element(ngx_http_cp_list_iterator *iterator, const size_t index)
 {
-    while (iterator->current_list_element_index < index) {
-        if (iterator->current_part_element_index >= iterator->current_part->nelts) {
-            if (iterator->current_part->next == NULL) break;
+    if (iterator == NULL || index < iterator->current_list_element_index) return NULL;
 
+    while (iterator->current_part != NULL) {
+        if (iterator->current_part_element_index >= iterator->current_part->nelts) {
             iterator->current_part = iterator->current_part->next;
             iterator->current_part_element_index = 0;
+            continue;
         }
 
+        if (iterator->current_list_element_index == index) {
+            return (char *)iterator->current_part->elts +
+                iterator->list_element_size * iterator->current_part_element_index;
+        }
         iterator->current_part_element_index++;
         iterator->current_list_element_index++;
     }
 
-    if (iterator->current_part->next == NULL && iterator->current_list_element_index < index) return NULL;
-
-    return (char *)(iterator->current_part)->elts + iterator->list_element_size * iterator->current_part_element_index;
+    return NULL;
 }
 
 ngx_int_t
@@ -542,35 +545,36 @@ get_timeout_val_msec(const int delta_time_in_msec)
     return time;
 }
 
+static size_t
+copy_web_response_field(void *destination, size_t capacity, const ngx_str_t *source, const char *name)
+{
+    size_t length = source->len;
+    if (length >= capacity) {
+        write_dbg(DBG_LEVEL_WARNING, "Truncating custom response %s to %zu bytes", name, capacity - 1);
+        length = capacity - 1;
+    }
+    if (length > 0) ngx_memcpy(destination, source->data, length);
+    ((u_char *)destination)[length] = 0;
+    return length;
+}
+
 void
 set_custom_response_block_page(const ngx_str_t *title, const ngx_str_t *body, const ngx_str_t *uuid, ngx_uint_t response_code)
 {
     write_dbg(
         DBG_LEVEL_TRACE,
-        "Setting Custom response page:\nresponse_code = %d, title size = %d, body size = %d, uuid = %s, uuid size = %d",
+        "Setting Custom response page:\nresponse_code = %d, title size = %d, body size = %d, uuid size = %d",
         response_code,
         title->len,
         body->len,
-        uuid->data,
         uuid->len
     );
 
     web_triggers_response_code = response_code;
 
-    web_response_title_size = title->len;
-    web_response_body_size = body->len;
-    web_response_uuid_size = uuid->len;
-
-    memcpy(web_response_uuid, uuid->data, web_response_uuid_size);
-    web_response_uuid[web_response_uuid_size] = 0;
-
-    if (web_response_title_size == 0 || web_response_body_size == 0) return;
-    // Copies the provided variables into their respective response variables.
-    memcpy(web_response_title, title->data, web_response_title_size);
-    memcpy(web_response_body, body->data, web_response_body_size);
-    if (web_response_uuid_size >= sizeof(web_response_uuid)) {
-        web_response_uuid_size = sizeof(web_response_uuid) - 1;
-    }
+    web_response_title_size = copy_web_response_field(web_response_title, sizeof(web_response_title), title, "title");
+    web_response_body_size = copy_web_response_field(web_response_body, sizeof(web_response_body), body, "body");
+    web_response_uuid_size = copy_web_response_field(web_response_uuid, sizeof(web_response_uuid), uuid, "UUID");
 }
 
 void
@@ -582,14 +586,8 @@ set_redirect_response(const ngx_str_t *location, const ngx_str_t *uuid, uint add
 
     add_event_id = add_event_id_to_header;
     // Sets the redirection location data and the web response uuid.
-    redirect_location_size = location->len;
-    memcpy(redirect_location, location->data, redirect_location_size);
-    web_response_uuid_size = uuid->len;
-    if (web_response_uuid_size >= sizeof(web_response_uuid)) {
-        web_response_uuid_size = sizeof(web_response_uuid) - 1;
-    }
-    memcpy(web_response_uuid, uuid->data, web_response_uuid_size);
-    web_response_uuid[web_response_uuid_size] = 0;
+    redirect_location_size = copy_web_response_field(redirect_location, sizeof(redirect_location), location, "location");
+    web_response_uuid_size = copy_web_response_field(web_response_uuid, sizeof(web_response_uuid), uuid, "UUID");
 }
 
 u_char *
@@ -630,14 +628,21 @@ get_block_page_response(ngx_http_request_t *request, ngx_chain_t (*out_chain)[7]
     ngx_chain_t *tmp_next;
     size_t incident_prefix_size = strlen("Incident Id: ");
     ngx_buf_t *buf[7]; // Title prefix -> Title -> Body prefix -> Body -> UUID prefix -> UUID -> UUID suffix
-    ngx_str_t title  = { web_response_title_size, (u_char *)web_response_title };
-    ngx_str_t body = { web_response_body_size, (u_char *)web_response_body };
-    ngx_str_t uuid = { web_response_uuid_size + incident_prefix_size, (u_char *)incident };
+    ngx_str_t title = { web_response_title_size, NULL };
+    ngx_str_t body = { web_response_body_size, NULL };
+    ngx_str_t uuid = { web_response_uuid_size + incident_prefix_size, NULL };
 
     if (web_response_title_size == 0 || web_response_body_size == 0) return NGX_ERROR_ERR;
 
-    memcpy(incident, "Incident Id: ", incident_prefix_size);
-    memcpy(incident + incident_prefix_size, web_response_uuid, web_response_uuid_size);
+    title.data = ngx_pnalloc(request->pool, title.len);
+    body.data = ngx_pnalloc(request->pool, body.len);
+    uuid.data = ngx_pnalloc(request->pool, uuid.len);
+    if (title.data == NULL || body.data == NULL || uuid.data == NULL) return NGX_ERROR_ERR;
+
+    ngx_memcpy(title.data, web_response_title, title.len);
+    ngx_memcpy(body.data, web_response_body, body.len);
+    ngx_memcpy(uuid.data, "Incident Id: ", incident_prefix_size);
+    ngx_memcpy(uuid.data + incident_prefix_size, web_response_uuid, web_response_uuid_size);
 
     for (idx = 0; idx < 7; idx++) {
         buf[idx] = ngx_calloc_buf(request->pool);
@@ -701,27 +706,17 @@ get_response_code(void)
 void
 free_custom_response_headers(void)
 {
-    CustomResponseHeader *current = custom_response_headers;
-    CustomResponseHeader *next;
-    
-    while (current != NULL) {
-        next = current->next;
-        if (current->key.data && memory_pool) {
-            ngx_pfree(memory_pool, current->key.data);
-        }
-        if (current->value.data && memory_pool) {
-            ngx_pfree(memory_pool, current->value.data);
-        }
-        if (memory_pool) {
-            ngx_pfree(memory_pool, current);
-        }
-        current = next;
+    if (custom_response_pool != NULL) {
+        ngx_destroy_pool(custom_response_pool);
+        custom_response_pool = NULL;
     }
     custom_response_headers = NULL;
+    custom_response_body.data = NULL;
+    custom_response_body.len = 0;
 }
 
-void
-set_custom_response(const ngx_str_t *body, ngx_uint_t response_code, CustomResponseHeader *headers)
+ngx_int_t
+set_custom_response(const ngx_str_t *body, ngx_uint_t response_code, CustomResponseHeader *headers, ngx_pool_t *pool)
 {
     write_dbg(
         DBG_LEVEL_DEBUG,
@@ -730,25 +725,21 @@ set_custom_response(const ngx_str_t *body, ngx_uint_t response_code, CustomRespo
         body->len
     );
     
-    custom_response_code = response_code;
-    
+    u_char *body_copy = ngx_pnalloc(pool, body->len + 1);
+    if (body_copy == NULL) {
+        write_dbg(DBG_LEVEL_WARNING, "Failed to allocate custom response body");
+        return NGX_ERROR;
+    }
+    if (body->len > 0) ngx_memcpy(body_copy, body->data, body->len);
+    body_copy[body->len] = 0;
+
     free_custom_response_headers();
+    custom_response_pool = pool;
+    custom_response_code = response_code;
     custom_response_headers = headers;
-    
-    if (custom_response_body.data && memory_pool) {
-        ngx_pfree(memory_pool, custom_response_body.data);
-        custom_response_body.data = NULL;
-        custom_response_body.len = 0;
-    }
-    
-    if (memory_pool && body->len > 0) {
-        custom_response_body.len = body->len;
-        custom_response_body.data = ngx_pcalloc(memory_pool, body->len + 1);
-        if (custom_response_body.data) {
-            ngx_memcpy(custom_response_body.data, body->data, body->len);
-            custom_response_body.data[body->len] = 0;
-        }
-    }
+    custom_response_body.data = body_copy;
+    custom_response_body.len = body->len;
+    return NGX_OK;
 }
 
 ngx_int_t
@@ -765,7 +756,12 @@ get_custom_response_page(ngx_http_request_t *request, ngx_chain_t (*out_chain)[1
         return NGX_ERROR_ERR;
     }
     
-    buf->pos = custom_response_body.data;
+    buf->pos = ngx_pnalloc(request->pool, custom_response_body.len);
+    if (buf->pos == NULL) {
+        write_dbg(DBG_LEVEL_WARNING, "Failed to copy custom response body");
+        return NGX_ERROR_ERR;
+    }
+    ngx_memcpy(buf->pos, custom_response_body.data, custom_response_body.len);
     buf->last = buf->pos + custom_response_body.len;
     buf->memory = 1;
     buf->last_buf = 1;

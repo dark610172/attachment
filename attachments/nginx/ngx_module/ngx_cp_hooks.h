@@ -40,6 +40,7 @@ static const ngx_int_t METRIC_TIMEOUT_VAL = METRIC_PERIODIC_TIMEOUT;
 typedef struct ngx_http_cp_session_data {
     ngx_int_t              was_request_fully_inspected; ///< Holds if the request fully inspected.
     ServiceVerdict         verdict; ///< Holds the session's verdict from the Nano Service.
+    unsigned              local_ipc_size_rejection:1; ///< Reject without agent response state.
     uint32_t               session_id; ///< Current session's Id.
     ngx_int_t              remaining_messages_to_reply; ///< Remaining messages left for the agent to respond to.
     ngx_http_response_data response_data; ///< Holds session's response data.
@@ -48,10 +49,14 @@ typedef struct ngx_http_cp_session_data {
     double                 res_proccesing_time; ///< Holds session's response processing time.
     uint64_t               processed_req_body_size; ///< Holds session's request body's size.
     uint64_t               processed_res_body_size; ///< Holds session's response body's size'.
+    ngx_chain_t           *body_sender_chain; ///< Buffer with an unsent body suffix.
+    size_t                 body_sender_offset; ///< Bytes already sent from that buffer.
+    ngx_chain_t           *compression_free; ///< Reusable response output buffers.
+    ngx_chain_t           *compression_busy; ///< Output still held by downstream filters.
     ngx_int_t              is_res_body_inspected; ///< Holds if the response body was inspected
     ngx_int_t              async_processing_needed; ///< Holds if async processing is needed in filters
     ngx_int_t              body_processed; ///< Holds if request body processing is complete
-    ngx_int_t              initial_async_mode; ///< Initial async mode for this request (0=sync, 1=async, -1=unset)
+    ngx_int_t              initial_async_mode; ///< Session mode, fixed before agent communication (0=sync, 1=async)
 } ngx_http_cp_session_data;
 
 ///
@@ -144,7 +149,11 @@ ServiceVerdict enforce_sessions_rate();
 ngx_int_t ngx_http_cp_request_and_response_size_handler(ngx_http_request_t *request);
 
 // Session management functions
-ngx_http_cp_session_data *init_cp_session_data(ngx_http_request_t *request);
+ngx_int_t ngx_cp_primary_ipc_ready(void);
+ngx_http_cp_session_data *init_cp_session_data(ngx_http_request_t *request, ngx_int_t async_mode);
+#ifdef NGINX_ASYNC_SUPPORTED
+ngx_uint_t ngx_cp_active_sync_sessions(void);
+#endif
 ngx_http_cp_session_data *recover_cp_session_data(ngx_http_request_t *request);
 
 // Utility functions
@@ -158,6 +167,14 @@ ngx_int_t ngx_http_cp_finalize_request_headers_hook(
 // Sync and async handlers
 ngx_int_t ngx_http_cp_req_header_handler_sync(ngx_http_request_t *request);
 ngx_int_t ngx_http_cp_req_body_filter_sync(ngx_http_request_t *request, ngx_chain_t *request_body_chain);
+
+///
+/// @brief Rejects a request from inside the request body filter (sends the block response).
+/// @param[in, out] request NGINX request.
+/// @param[in] is_custom_response 1 for the custom response, 0 for the block page.
+/// @returns ngx_int_t value to return from the body filter.
+///
+ngx_int_t ngx_http_cp_reject_from_req_body_filter(ngx_http_request_t *request, ngx_int_t is_custom_response);
 ngx_int_t ngx_http_cp_res_body_filter_sync(ngx_http_request_t *request, ngx_chain_t *body_chain);
 ngx_int_t ngx_http_cp_res_body_filter_core(ngx_http_request_t *request, ngx_chain_t *body_chain, int filter_mode);
 ngx_int_t ngx_http_cp_res_header_filter_sync(ngx_http_request_t *request);

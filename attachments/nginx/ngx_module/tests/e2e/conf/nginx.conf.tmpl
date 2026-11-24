@@ -1,0 +1,27 @@
+proxy_cache_path /tmp/cache levels=1 keys_zone=c1:1m max_size=200m;
+upstream be {
+    server backend:80;
+    keepalive 64;
+}
+server {
+    listen 80 default_server;
+    client_max_body_size 0;
+    client_body_buffer_size ${BODYBUF};
+    ${HTTP2_DIRECTIVE}
+    location /cached/ {
+        proxy_pass http://be/;
+        proxy_http_version 1.1;
+        proxy_set_header Connection "";
+        proxy_cache c1;
+        proxy_cache_valid 200 10m;
+        add_header X-Cache $upstream_cache_status;
+    }
+    location /sink {
+        proxy_pass http://echo:8000;
+    }
+    location / {
+        proxy_pass http://be;
+        proxy_http_version 1.1;
+        proxy_set_header Connection "";
+    }
+}

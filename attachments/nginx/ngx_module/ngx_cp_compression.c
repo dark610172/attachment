@@ -171,8 +171,12 @@ ngx_chain_remove_empty_chunks(ngx_chain_t **chain, ngx_pool_t *pool)
     while (curr) {
         ngx_buf_t *b = curr->buf;
 
-        /* Keep special links (flush/last_buf/sync) even if size is 0 */
-        if (ngx_buf_special(b)) {
+        /* Keep control buffers even when the source had memory flags set. */
+        if (ngx_buf_size(b) == 0 && (b->flush || b->last_buf || b->sync || b->last_in_chain)) {
+            b->temporary = 0;
+            b->memory = 0;
+            b->mmap = 0;
+            b->in_file = 0;
             prev = curr;
             curr = curr->next;
             chunk_index++;
@@ -198,10 +202,7 @@ ngx_chain_remove_empty_chunks(ngx_chain_t **chain, ngx_pool_t *pool)
         chunk_index++;
     }
 
-    if (*chain == NULL) {
-        write_dbg(DBG_LEVEL_WARNING, "Empty chain after removing empty chunks");
-        return NGX_ERROR;
-    }
+    /* A valid non-final fragment may produce no output yet. */
     return NGX_OK;
 }
 
@@ -313,6 +314,16 @@ compression_buffer_filter(
     ngx_str_t dest_data;
     ngx_int_t compression_result;
     write_dbg(DBG_LEVEL_DEBUG, "Performing %s on buffer", should_compress ? "compression" : "decompression");
+
+    if (!should_compress && ngx_buf_size(src) == 0 &&
+        (src->flush || src->last_buf || src->sync || src->last_in_chain)) {
+        *dest = *src;
+        dest->temporary = 0;
+        dest->memory = 0;
+        dest->mmap = 0;
+        dest->in_file = 0;
+        return NGX_OK;
+    }
 
     if (is_valid_compression_buffer(should_compress, src) != NGX_OK) {
         // Invalid buffer provided.
@@ -661,5 +672,90 @@ compress_body(
         1
     );
 
+    return NGX_OK;
+}
+
+/* Keep output storage bounded by downstream demand, using NGINX's free/busy lists. */
+ngx_int_t
+compress_body_reuse(
+    CompressionStream *compression_stream,
+    const CompressionType compression_type,
+    const int is_last_part,
+    ngx_chain_t *input,
+    ngx_chain_t **output,
+    ngx_chain_t **free_buffers,
+    ngx_buf_tag_t tag,
+    ngx_pool_t *pool
+)
+{
+    static const size_t output_buffer_size = 16384;
+    ngx_chain_t **tail = output;
+    ngx_chain_t *cl;
+    ngx_buf_t *b;
+    CompressionResult result;
+    size_t offset, size;
+    u_char *storage;
+    int last;
+
+    *output = NULL;
+    for (; input != NULL; input = input->next) {
+        b = input->buf;
+        if (b->in_file && !ngx_buf_in_memory(b) && b->file_last > b->file_pos) {
+            return NGX_ERROR;
+        }
+        size = b->pos != NULL ? (size_t)(b->last - b->pos) : 0;
+        last = b->last_buf || (is_last_part && input->next == NULL);
+        result.output = NULL;
+        result.num_output_bytes = 0;
+        if (size != 0 || last) {
+            result = compressData(compression_stream, compression_type, size,
+                                  size != 0 ? b->pos : (u_char *)"", last);
+            if (!result.ok) {
+                updateMetricField(RES_FAILED_COMPRESSION_COUNT, 1);
+                return NGX_ERROR;
+            }
+        }
+
+        offset = 0;
+        cl = NULL;
+        while (offset < result.num_output_bytes ||
+               (cl == NULL && (b->flush || b->last_buf || b->sync || b->last_in_chain))) {
+            cl = ngx_chain_get_free_buf(pool, free_buffers);
+            if (cl == NULL) {
+                free(result.output);
+                return NGX_ERROR;
+            }
+            if (cl->buf->start == NULL) {
+                cl->buf->start = ngx_palloc(pool, output_buffer_size);
+                if (cl->buf->start == NULL) {
+                    free(result.output);
+                    return NGX_ERROR;
+                }
+            }
+            storage = cl->buf->start;
+            ngx_memzero(cl->buf, sizeof(ngx_buf_t));
+            cl->buf->start = storage;
+            cl->buf->end = storage + output_buffer_size;
+            cl->buf->pos = storage;
+            size = result.num_output_bytes - offset;
+            if (size > output_buffer_size) size = output_buffer_size;
+            if (size != 0) ngx_memcpy(storage, result.output + offset, size);
+            cl->buf->last = storage + size;
+            cl->buf->temporary = size != 0;
+            cl->buf->tag = tag;
+            cl->next = NULL;
+            offset += size;
+            if (offset == result.num_output_bytes) {
+                cl->buf->flush = b->flush;
+                cl->buf->last_buf = b->last_buf;
+                cl->buf->last_in_chain = b->last_in_chain;
+                cl->buf->sync = b->sync || (size == 0 && b->last_in_chain);
+            }
+            *tail = cl;
+            tail = &cl->next;
+        }
+        free(result.output);
+    }
+    updateMetricField(RES_SUCCESSFUL_COMPRESSION_COUNT, 1);
     return NGX_OK;
 }
